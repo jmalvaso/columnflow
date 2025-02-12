@@ -213,6 +213,11 @@ class PlotVariablesBaseSingleShift(
 
     def workflow_requires(self):
         reqs = super().workflow_requires()
+
+        # no need to require merged histograms since each branch already requires them as a workflow
+        # if self.workflow == "local":
+        #     reqs.pop("merged_hists", None)
+
         return reqs
 
     def requires(self):

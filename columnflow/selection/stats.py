@@ -145,7 +145,7 @@ def increment_stats(
                 "'num' or 'sum'",
             )
 
-        # interpret obj based on the aoperation to be applied
+        # interpret obj based on the operation to be applied
         weights = None
         weight_mask = Ellipsis
         if isinstance(obj, (tuple, list)):

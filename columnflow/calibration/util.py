@@ -13,6 +13,9 @@ from columnflow.util import maybe_import
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
 
+import law
+
+logger = law.logger.get_logger(__name__)
 
 # https://github.com/scikit-hep/awkward/issues/489\#issuecomment-711090923
 def ak_random(*args, rand_func: Callable) -> ak.Array:
@@ -91,7 +94,29 @@ def propagate_met(
     if jet_pt2.ndim > 1:
         jet_px2 = ak.sum(jet_px2, axis=1)
         jet_py2 = ak.sum(jet_py2, axis=1)
+    
+    # RawPuppiMET sanity check
+           
+    crazy_PuppiMET_values_mask = met_pt1 > 14*10**3     
+    
+    crazy_PuppiMET_values = met_pt1[crazy_PuppiMET_values_mask]
+    
+    # Get the indices of the infinite values
+    crazy_PuppiMET_indices = np.where(crazy_PuppiMET_values_mask)[0]
 
+    # Count the number of infinite values
+    crazy_PuppiMET_count = ak.sum(crazy_PuppiMET_values_mask)
+    
+    if crazy_PuppiMET_count > 0:
+        # Replace infinite values with 0
+        met_pt1 = ak.where(~crazy_PuppiMET_values_mask, met_pt1, 1000)
+
+        # Raise a warning about the replacement
+        logger.warning(
+            f"Warning: Found and replaced {crazy_PuppiMET_count} crazy value(s) {crazy_PuppiMET_values.tolist()} in 'RawPuppiMET.pt' with 1000.\n"
+            f"Indices in the chuck: {crazy_PuppiMET_indices.tolist()}\n"
+            f"We will get rid of these events in the selection step")
+        
     # propagate to met
     met_px2 = met_pt1 * np.cos(met_phi1) - (jet_px2 - jet_px1)
     met_py2 = met_pt1 * np.sin(met_phi1) - (jet_py2 - jet_py1)
