@@ -39,7 +39,10 @@ def gen_parton_top(self: Producer, events: ak.Array, **kwargs) -> ak.Array:
     # find parton-level top quarks
     abs_id = abs(events.GenPart.pdgId)
     t = events.GenPart[abs_id == 6]
-    t = t[t.hasFlags("isLastCopy")]
+    bit = 13 # It is crucial that the pT value used when you calculate the weights is derived from the 'isLastCopy' definition of the parton-level top quark (after radiation and before decay) in Pythia8
+    bit_mask = 1<<(bit-1)
+    Filter_Bits = ((t.statusFlags & bit_mask) != 0)
+    t = t[Filter_Bits]
     t = t[~ak.is_none(t, axis=1)]
 
     # save the column
@@ -137,4 +140,4 @@ def top_pt_weight_skip(self: Producer) -> bool:
     if not getattr(self, "dataset_inst", None):
         return False
 
-    return self.dataset_inst.is_data or not self.dataset_inst.has_tag("is_ttbar")
+    return self.dataset_inst.is_data or not self.dataset_inst.has_tag("ttbar")

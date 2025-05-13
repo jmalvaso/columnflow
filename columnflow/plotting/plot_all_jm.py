@@ -6,15 +6,9 @@ Example plot function.
 
 from __future__ import annotations
 
-__all__ = []
-
 from columnflow.types import Sequence
 from columnflow.util import maybe_import, try_float
-from columnflow.plotting.plot_util import (
-    get_position,
-    get_cms_label,
-    remove_label_placeholders,
-)
+from columnflow.plotting.plot_util import get_position, get_cms_label
 
 hist = maybe_import("hist")
 np = maybe_import("numpy")
@@ -181,61 +175,55 @@ def plot_all(
     "ratio_kwargs": dict (optional),
 
     The *style_config* expects fields (all optional):
-    "gridspec_cfg": dict,
     "ax_cfg": dict,
     "rax_cfg": dict,
     "legend_cfg": dict,
     "cms_label_cfg": dict,
 
     :param plot_config: Dictionary that defines which plot methods will be called with which
-        key word arguments.
+    key word arguments.
     :param style_config: Dictionary that defines arguments on how to style the overall plot.
     :param skip_ratio: Optional bool parameter to not display the ratio plot.
     :param skip_legend: Optional bool parameter to not display the legend.
     :param cms_label: Optional string parameter to set the CMS label text.
     :param whitespace_fraction: Optional float parameter that defines the ratio of which
-        the plot will consist of whitespace for the legend and labels
+    the plot will consist of whitespace for the legend and labels
     :param magnitudes: Optional float parameter that defines the displayed ymin when plotting
-        with a logarithmic scale.
+    with a logarithmic scale.
     :return: tuple of plot figure and axes
     """
-    # general mplhep style
-    plt.style.use(mplhep.style.CMS)
-
-    # setup figure and axes
-    rax = None
-    grid_spec = {"left": 0.15, "right": 0.95, "top": 0.95, "bottom": 0.1}
-    grid_spec |= style_config.get("gridspec_cfg", {})
-    if not skip_ratio:
-        grid_spec |= {"height_ratios": [3, 1], "hspace": 0}
-        fig, axs = plt.subplots(2, 1, gridspec_kw=grid_spec, sharex=True)
-        (ax, rax) = axs
-    else:
-        fig, ax = plt.subplots(gridspec_kw=grid_spec)
-        axs = (ax,)
-
-    # invoke all plots methods
+    # available plot methods mapped to their names
     plot_methods = {
         func.__name__: func
         for func in [draw_error_bands, draw_stack, draw_hist, draw_profile, draw_errorbars]
     }
+
+    plt.style.use(mplhep.style.CMS)
+
+    rax = None
+    if not skip_ratio:
+        fig, axs = plt.subplots(2, 1, gridspec_kw=dict(height_ratios=[3, 1], hspace=0), sharex=True)
+        (ax, rax) = axs
+    else:
+        fig, ax = plt.subplots()
+        axs = (ax,)
+    total_events = kwargs["total_events"]
+    total_variance = kwargs["total_variance"]
     for key, cfg in plot_config.items():
-        # check if required fields are present
         if "method" not in cfg:
             raise ValueError(f"no method given in plot_cfg entry {key}")
+        method = cfg["method"]
+
         if "hist" not in cfg:
             raise ValueError(f"no histogram(s) given in plot_cfg entry {key}")
+        hist = cfg["hist"]
+        kwargs = cfg.get("kwargs", {})
+        plot_methods[method](ax, hist, **kwargs)
 
-        # invoke the method
-        method = cfg["method"]
-        h = cfg["hist"]
-        plot_methods[method](ax, h, **cfg.get("kwargs", {}))
-
-        # repeat for ratio axes if configured
         if not skip_ratio and "ratio_kwargs" in cfg:
             # take ratio_method if the ratio plot requires a different plotting method
             method = cfg.get("ratio_method", method)
-            plot_methods[method](rax, h, **cfg.get("ratio_kwargs", {}))
+            plot_methods[method](rax, hist, **cfg["ratio_kwargs"])
 
     # axis styling
     ax_kwargs = {
@@ -254,26 +242,17 @@ def plot_all(
     # prioritize style_config ax settings
     ax_kwargs.update(style_config.get("ax_cfg", {}))
 
-    # some settings cannot be handled by ax.set
-    xminorticks = ax_kwargs.pop("xminorticks", ax_kwargs.pop("minorxticks", None))
-    yminorticks = ax_kwargs.pop("yminorticks", ax_kwargs.pop("minoryticks", None))
-    xloc = ax_kwargs.pop("xloc", None)
-    yloc = ax_kwargs.pop("yloc", None)
+    # ax configs that can not be handled by ax.set
+    minorxticks = ax_kwargs.pop("minorxticks", None)
+    minoryticks = ax_kwargs.pop("minoryticks", None)
 
-    # set all values
     ax.set(**ax_kwargs)
 
-    # set manual configs
-    if xminorticks is not None:
-        ax.set_xticks(xminorticks, minor=True)
-    if yminorticks is not None:
-        ax.set_xticks(yminorticks, minor=True)
-    if xloc is not None:
-        ax.set_xlabel(ax.get_xlabel(), loc=xloc)
-    if yloc is not None:
-        ax.set_ylabel(ax.get_ylabel(), loc=yloc)
+    if minorxticks is not None:
+        ax.set_xticks(minorxticks, minor=True)
+    if minoryticks is not None:
+        ax.set_xticks(minoryticks, minor=True)
 
-    # ratio plot
     if not skip_ratio:
         # hard-coded line at 1
         rax.axhline(y=1.0, linestyle="dashed", color="gray")
@@ -284,25 +263,11 @@ def plot_all(
             "yscale": "linear",
         }
         rax_kwargs.update(style_config.get("rax_cfg", {}))
-
-        # some settings cannot be handled by ax.set
-        xloc = rax_kwargs.pop("xloc", None)
-        yloc = rax_kwargs.pop("yloc", None)
-
-        # set all values
         rax.set(**rax_kwargs)
 
-        # set manual configs
-        if xloc is not None:
-            rax.set_xlabel(rax.get_xlabel(), loc=xloc)
-        if yloc is not None:
-            rax.set_ylabel(rax.get_ylabel(), loc=yloc)
-
-        # remove x-label from main axis
         if "xlabel" in rax_kwargs:
             ax.set_xlabel("")
 
-    # label alignment
     fig.align_labels()
 
     # legend
@@ -311,75 +276,71 @@ def plot_all(
         legend_kwargs = {
             "ncol": 2,
             "loc": "center left",
-            "bbox_to_anchor": (0.15, 0.8),  # Position the legend outside the plot
+            "bbox_to_anchor": (0.25, 0.8),  # Position the legend outside the plot
                                          # Moves the legend to the right side of the plot.
                                          # The first value (1) controls the horizontal position,
                                          # and the second value (0.95) controls the vertical position.
-            "fontsize": 12, 
+            "fontsize": 16, 
         }
+        
         legend_kwargs.update(style_config.get("legend_cfg", {}))
-
-        if "title" in legend_kwargs:
-            legend_kwargs["title"] = remove_label_placeholders(legend_kwargs["title"])
 
         # retrieve the legend handles and their labels
         handles, labels = ax.get_legend_handles_labels()
 
-        # custom argument: entries_per_column
-        n_cols = legend_kwargs.get("ncols", 1)
-        entries_per_col = legend_kwargs.pop("entries_per_column", None)
-        if callable(entries_per_col):
-            entries_per_col = entries_per_col(ax, handles, labels, n_cols)
-        if entries_per_col and n_cols > 1:
-            if isinstance(entries_per_col, (list, tuple)):
-                assert len(entries_per_col) == n_cols
-            else:
-                entries_per_col = [entries_per_col] * n_cols
-            # fill handles and labels with empty entries
-            max_entries = max(entries_per_col)
-            empty_handle = ax.plot([], label="", linestyle="None")[0]
-            for i, n in enumerate(entries_per_col):
-                for _ in range(max_entries - min(n, len(handles) - sum(entries_per_col[:i]))):
-                    handles.insert(i * max_entries + n, empty_handle)
-                    labels.insert(i * max_entries + n, "")
+        keywords_to_labels = {
+            'dy_lep'     : '$Z \\rightarrow ll$',
+            'dy_z2tautau': '$Z \\rightarrow \\tau\\tau$+jet fakes',
+            'dy_z2mumu'  : '$Z \\rightarrow \\mu\\mu$',
+            'dy_z2ee'    : '$Z \\rightarrow ee$',
+            'vv'         : 'Di-Boson',
+            'tt'         : '$t\\bar{t}$ + Jets',
+            'st'         : 'Single $t$/$\\bar{t}$',
+            'wj'         : 'W + jets',
+            'qcd'        : 'QCD',
+            'data'       : 'Data',
+        }
 
-        # custom hook to adjust handles and labels
-        update_handles_labels = legend_kwargs.pop("update_handles_labels", None)
-        if callable(update_handles_labels):
-            update_handles_labels(ax, handles, labels, n_cols)
-        
-        # your original data
-        events   = kwargs["total_events"]
-        variance = kwargs["total_variance"]
-        labels_ext = list(labels)  # make a copy
+        #'h_ggf_htt'  : kwargs["h_ggf_htt"],
+        # Create process_to_label dynamically based on matching
+        process_to_label = {
+            process.name: keywords_to_labels.get(process.name, "Unknown")
+            for process in total_events.keys()
+        }
 
-        # # map process names → index in `labels`
-        # proc_to_idx = {
-        #     "qcd":         0,
-        #     "wj":          1,
-        #     "st":          2,
-        #     "tt":          3,
-        #     "vv":          4,
-        #     "dy_lep":      5,
-        #     "h_ggf_htt":   6,
-        #     "data":        8,
-        # }
+        # Construct the updated labels
+        updated_labels = []
+        for label in labels:
+            matched = False
+            for process, yield_value in total_events.items():
+                variance_value = total_variance.get(process, 0)  # Get variance, default to 0 if not found
+                if process_to_label.get(process.name) == label:
+                    updated_labels.append(f"{label} ({yield_value:.0f} ± {variance_value:.0f})")
+                    matched = True
+                    break
+            if not matched:
+                # If no match is found, keep the original label
+                updated_labels.append(label)
+   
+        # assume all StepPatch objects are part of MC stack
+        in_stack = [
+            isinstance(handle, mpl.patches.StepPatch)
+            for handle in handles
+        ]
 
-        # fill in the eight process labels
-        idx = 0
-        for proc_obj, ev in events.items():
-            name = proc_obj.name
-            # if name not in proc_to_idx:
-            #     continue
-            # idx = proc_to_idx[name]
-            var = variance[proc_obj]
-            # format: integer events, one‐decimal variance
-            while idx < len(labels):
-                labels_ext[idx] = f"{labels_ext[idx]} ({ev:.0f} ± {var:.1f})"
-                idx += 1
+        # reverse order of entries that are part of the stack
+        if any(in_stack):
+            def shuffle(entries, mask):
+                entries = np.array(entries, dtype=object)
+                entries[mask] = entries[mask][::-1]
+                return list(entries)
+
+            handles = shuffle(handles, in_stack)
+            updated_labels = shuffle(updated_labels, in_stack)
 
         # make legend using ordered handles/labels
-        ax.legend(handles, labels_ext, **legend_kwargs)
+        ax.legend(handles, updated_labels, **legend_kwargs)
+
     # custom annotation
     log_x = style_config.get("ax_cfg", {}).get("xscale", "linear") == "log"
     annotate_kwargs = {
@@ -404,7 +365,6 @@ def plot_all(
         cms_label_kwargs.update(style_config.get("cms_label_cfg", {}))
         mplhep.cms.label(**cms_label_kwargs)
 
-    # finalization
-    fig.tight_layout()
+    plt.tight_layout()
 
     return fig, axs

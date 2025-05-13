@@ -132,6 +132,7 @@ class CalibrateEvents(
                 read_columns=len(inps) * [read_columns],
                 chunk_size=self.calibrator_inst.get_min_chunk_size(),
             ):
+                #from IPython import embed; embed()
                 # optional check for overlapping inputs
                 if self.check_overlapping_inputs:
                     self.raise_if_overlapping([events] + list(cols))
