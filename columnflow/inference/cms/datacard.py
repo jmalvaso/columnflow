@@ -95,9 +95,12 @@ class DatacardWriter(object):
         separators.add("counts")
 
         # shape lines
-        blocks.shapes = [("shapes", "*", "*", shapes_path_ref, nom_pattern, syst_pattern)]
+        blocks.shapes = [("shapes", "*", "*", shapes_path_ref, nom_pattern, syst_pattern),("shapes", "h_ggf_htt", "*", shapes_path_ref, nom_pattern+"_$MASS", syst_pattern)]
         separators.add("shapes")
-
+        signal_masses = [60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 160, 180, 200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1400, 1600, 1800, 2000, 2300, 2600, 2900, 3200, 3500]
+        for mass in signal_masses:
+            rates[cat_objects[0]['name']].pop(f"h_ggf_htt_{mass}")
+        rates[cat_objects[0]['name']]["h_ggf_htt"] = -1
         # observations
         blocks.observations = []
         if all("data" in _rates for _rates in rates.values()):
@@ -120,6 +123,10 @@ class DatacardWriter(object):
 
                 # devide into signal and backgrounds
                 if proc_name not in proc_names:
+                    if proc_name == "h_ggf_htt": 
+                        flat_rates[(cat_name, proc_name)] = rate
+                        s_names.append(proc_name)
+                        continue
                     proc_obj = self.inference_model_inst.get_process(proc_name, category=cat_name)
                     (s_names if proc_obj.is_signal else b_names).append(proc_name)
 
@@ -140,7 +147,9 @@ class DatacardWriter(object):
         # tabular-style parameters
         blocks.tabular_parameters = []
         rnd = lambda f: round(f, self.parameter_precision)
+        
         for param_name in self.inference_model_inst.get_parameters(flat=True):
+            
             param_obj = None
             effects = []
             for cat_name, proc_name in flat_rates:
@@ -231,7 +240,6 @@ class DatacardWriter(object):
                         f"effect '{effect}' of parameter '{param_name}' with type {param_obj.type} "
                         f"on process '{proc_name}' in category '{cat_name}' cannot be encoded",
                     )
-
             # add the tabular line
             if param_obj and effects:
                 type_str = "shape"
