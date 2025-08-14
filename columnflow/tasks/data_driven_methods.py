@@ -433,12 +433,12 @@ class ComputeFakeFactors(
             "plots": {
                 f"qcd_{s}_N_b_jets_{nb}": self.target(f"fake_factor_qcd_{s}_Nbjets_{nb}.png")
                 for s in ['nominal', 'up', 'down']
-                for nb in [0, 1]
+                for nb in [0, 1, 2]
             },
             "plots1d": {
                 f"qcd_{nj}_{nb}": self.target(f"fake_factor_qcd_Njets_{nj}_Nbjets_{nb}.png")
-                for nj in [0, 1, 2]
-                for nb in [0, 1]
+                for nj in [0, 1, 2, 3]
+                for nb in [0, 1, 2]
             },
             "fitres": self.target('_'.join(('fitres', channel, str(year), tag)) + '.json'),
         }
