@@ -51,6 +51,7 @@ def pu_weight(self: Producer, events: ak.Array, **kwargs) -> ak.Array:
 
         # evaluate and store the produced column
         pu_weight = self.pileup_corrector.evaluate(*inputs)
+        pu_weight[pu_weight > 300] = 0 # remove events with abnormally high pileup weights (should be few per dataset)
         events = set_ak_column(events, column_name, pu_weight, value_type=np.float32)
 
     return events

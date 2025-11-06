@@ -32,9 +32,9 @@ def mc_weight(self: Producer, events: ak.Array, **kwargs) -> ak.Array:
     [1] https://twiki.cern.ch/twiki/bin/view/CMSPublic/WorkBookNanoAOD?rev=99#Weigths
     """
     # determine the mc_weight
-    mc_weight = events.genWeight
+    mc_weight = np.sign(events.genWeight)
     if has_ak_column(events, "LHEWeight.originalXWGTUP") and ak.all(events.genWeight == 1.0):
-        mc_weight = events.LHEWeight.originalXWGTUP
+        mc_weight = np.sign(events.LHEWeight.originalXWGTUP)
 
     # store the column
     events = set_ak_column(events, "mc_weight", mc_weight, value_type=np.float32)
