@@ -22,8 +22,8 @@ NOTE: you are running a python interpreter inside the columnflow source director
 from collections.abc import KeysView, ValuesView  # noqa
 from types import ModuleType, GeneratorType, GenericAlias  # noqa
 from typing import (  # noqa
-    Any, Union, TypeVar, ClassVar, Sequence, Callable, Generator, TextIO, Iterable, Hashable,
-    Type,
+    TYPE_CHECKING, Any, Union, TypeVar, ClassVar, Sequence, Callable, Generator, TextIO, Iterable, Hashable, Type,
+    Literal, Protocol, runtime_checkable,
 )
 
 from typing_extensions import Annotated, _AnnotatedAlias as AnnotatedType, TypeAlias  # noqa
@@ -31,3 +31,6 @@ from typing_extensions import Annotated, _AnnotatedAlias as AnnotatedType, TypeA
 
 #: Generic type variable, more stringent than Any.
 T = TypeVar("T")
+
+#: Type of the UNSET attribute in util
+UNSET_TYPE = object

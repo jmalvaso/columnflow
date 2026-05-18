@@ -12,19 +12,23 @@ import inspect
 import law
 import order as od
 
-from columnflow.types import Callable, T
-from columnflow.util import maybe_import, DotDict, DerivableMeta
-from columnflow.columnar_util import TaskArrayFunction
+from columnflow.calibration import TaskArrayFunctionWithCalibratorRequirements
+from columnflow.util import maybe_import, DotDict, DerivableMeta, UNSET
+from columnflow.types import Callable, T, Sequence, UNSET_TYPE
 
 ak = maybe_import("awkward")
 
 
-class Selector(TaskArrayFunction):
+class Selector(TaskArrayFunctionWithCalibratorRequirements):
     """
     Base class for all selectors.
     """
 
     exposed = False
+
+    # register attributes for arguments accepted by decorator
+    mc_only: bool = False
+    data_only: bool = False
 
     def __init__(self: Selector, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -39,37 +43,39 @@ class Selector(TaskArrayFunction):
         cls,
         func: Callable | None = None,
         bases=(),
-        mc_only: bool = False,
-        data_only: bool = False,
+        mc_only: bool | UNSET_TYPE = UNSET,
+        data_only: bool | UNSET_TYPE = UNSET,
+        require_calibrators: Sequence[str] | set[str] | None | UNSET_TYPE = UNSET,
         **kwargs,
     ) -> DerivableMeta | Callable:
         """
-        Decorator for creating a new :py:class:`~.Selector` subclass with additional, optional
-        *bases* and attaching the decorated function to it as ``call_func``.
+        Decorator for creating a new :py:class:`~.Selector` subclass with additional, optional *bases* and attaching the
+        decorated function to it as ``call_func``.
 
-        When *mc_only* (*data_only*) is *True*, the selector is skipped and not considered by
-        other calibrators, selectors and producers in case they are evaluated on a
-        :py:class:`order.Dataset` (using the :py:attr:`dataset_inst` attribute) whose ``is_mc``
-        (``is_data``) attribute is *False*.
+        When *mc_only* (*data_only*) is *True*, the selector is skipped and not considered by other calibrators,
+        selectors and producers in case they are evaluated on a :py:class:`order.Dataset` (using the
+        :py:attr:`dataset_inst` attribute) whose ``is_mc`` (``is_data``) attribute is *False*.
 
         All additional *kwargs* are added as class members of the new subclasses.
 
         :param func: Function to be wrapped and integrated into new :py:class:`Selector` class.
         :param bases: Additional bases for the new :py:class:`Selector`.
-        :param mc_only: Boolean flag indicating that this :py:class:`Selector` should only run on
-            Monte Carlo simulation and skipped for real data.
-        :param data_only: Boolean flag indicating that this :py:class:`Selector` should only run on
-            real data and skipped for Monte Carlo simulation.
+        :param mc_only: Boolean flag indicating that this :py:class:`Selector` should only run on Monte Carlo simulation
+            and skipped for real data.
+        :param data_only: Boolean flag indicating that this :py:class:`Selector` should only run on real data and
+            skipped for Monte Carlo simulation.
+        :param require_calibrators: Sequence of names of calibrators to add to the requirements.
         :return: New :py:class:`Selector` subclass.
         """
         def decorator(func: Callable) -> DerivableMeta:
             # create the class dict
-            cls_dict = {
-                **kwargs,
-                "call_func": func,
-                "mc_only": mc_only,
-                "data_only": data_only,
-            }
+            cls_dict = {**kwargs, "call_func": func}
+            if mc_only is not UNSET:
+                cls_dict["mc_only"] = mc_only
+            if data_only is not UNSET:
+                cls_dict["data_only"] = data_only
+            if require_calibrators is not UNSET:
+                cls_dict["require_calibrators"] = require_calibrators
 
             # get the module name
             frame = inspect.stack()[1]
@@ -88,8 +94,7 @@ class Selector(TaskArrayFunction):
                     raise Exception(f"selector {cls_name} received both mc_only and data_only")
                 if (mc_only or data_only) and cls_dict.get("skip_func"):
                     raise Exception(
-                        f"selector {cls_name} received custom skip_func, but either mc_only or "
-                        "data_only are set",
+                        f"selector {cls_name} received custom skip_func, but either mc_only or data_only are set",
                     )
 
                 if "skip_func" not in cls_dict:

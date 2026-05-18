@@ -9,12 +9,13 @@ import itertools
 import luigi
 import law
 
-from columnflow.tasks.framework.base import Requirements, AnalysisTask, wrapper_factory
+from columnflow.tasks.framework.base import Requirements, AnalysisTask, wrapper_factory, RESOLVE_DEFAULT
 from columnflow.tasks.framework.mixins import ProducerMixin, ChunkedIOMixin
 from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.framework.decorators import on_failure
 from columnflow.tasks.reduction import ReducedEventsUser
 from columnflow.util import dev_sandbox
+from columnflow.types import Any
 
 
 class _ProduceColumns(
@@ -46,22 +47,20 @@ class ProduceColumns(_ProduceColumns):
     def workflow_requires(self):
         reqs = super().workflow_requires()
 
+        # add producer dependent requirements
+        reqs["producer"] = law.util.make_unique(law.util.flatten(self.producer_inst.run_requires(task=self)))
+
         # require the full merge forest
         reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
-
-        # add producer dependent requirements
-        reqs["producer"] = law.util.make_unique(law.util.flatten(
-            self.producer_inst.run_requires(task=self),
-        ))
 
         return reqs
 
     def requires(self):
         return {
-            "events": self.reqs.ProvideReducedEvents.req(self),
             "producer": law.util.make_unique(law.util.flatten(
                 self.producer_inst.run_requires(task=self),
             )),
+            "events": self.reqs.ProvideReducedEvents.req(self),
         }
 
     workflow_condition = ReducedEventsUser.workflow_condition.copy()
@@ -168,7 +167,12 @@ class ProduceColumns(_ProduceColumns):
         # merge output files
         sorted_chunks = [output_chunks[key] for key in sorted(output_chunks)]
         law.pyarrow.merge_parquet_task(
-            self, sorted_chunks, output["columns"], local=True, writer_opts=self.get_parquet_writer_opts(),
+            task=self,
+            inputs=sorted_chunks,
+            output=output["columns"],
+            local=True,
+            writer_opts=self.get_parquet_writer_opts(),
+            target_row_group_size=self.merging_row_group_size,
         )
 
 
@@ -192,14 +196,35 @@ _ProduceColumnsWrapperBase = wrapper_factory(
     enable=["configs", "skip_configs", "datasets", "skip_datasets", "shifts", "skip_shifts"],
 )
 _ProduceColumnsWrapperBase.exclude_index = True
+delattr(_ProduceColumnsWrapperBase, "producer")
 
 
 class ProduceColumnsWrapper(_ProduceColumnsWrapperBase):
 
     producers = law.CSVParameter(
-        default=(),
-        description="names of producers to use; if empty, the default producer is used",
+        default=(RESOLVE_DEFAULT,),
+        description="comma-separated names of producers to be applied; default: value of the 'default_producer' "
+        "analysis aux",
+        brace_expand=True,
+        parse_empty=True,
     )
+
+    @classmethod
+    def modify_param_values(cls, params: dict[str, Any]) -> dict[str, Any]:
+        params = super().modify_param_values(params)
+
+        if params.get("analysis_inst"):
+            config_insts = [params["analysis_inst"].get_config(name) for name in params["configs"]]
+            params["producers"] = cls.resolve_config_default_and_groups(
+                param=params.get("producers"),
+                task_params=params,
+                container=config_insts,
+                default_str="default_producer",
+                groups_str="producer_groups",
+                multi_strategy="same",
+            )
+
+        return params
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

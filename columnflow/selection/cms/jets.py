@@ -11,7 +11,7 @@ import math
 
 from columnflow.selection import Selector, SelectionResult, selector
 from columnflow.util import maybe_import, load_correction_set, DotDict
-from columnflow.columnar_util import set_ak_column, flat_np_view, optional_column as optional
+from columnflow.columnar_util import set_ak_column, flat_np_view, layout_ak_array
 from columnflow.types import Any
 
 np = maybe_import("numpy")
@@ -22,11 +22,9 @@ logger = law.logger.get_logger(__name__)
 
 
 @selector(
-    uses={
-        "Jet.{pt,eta,phi,mass,jetId,chEmEF}", optional("Jet.puId"),
-        "Muon.{pt,eta,phi,mass,isPFcand}",
-    },
+    # all used columns are registered in init below
     produces={"Jet.veto_map_mask"},
+    use_lepton_veto_id=None,  # depends on the "run" info of the underlying campaign of the config
     get_veto_map_file=(lambda self, external_files: external_files.jet_veto_map),
 )
 def jet_veto_map(
@@ -35,14 +33,16 @@ def jet_veto_map(
     **kwargs,
 ) -> tuple[ak.Array, SelectionResult]:
     """
-    Selector that applies the Jet Veto Map to the jets and stores the result as a new column ``Jet.veto_maps``.
-    Additionally, the ``jet_veto_map`` step is added to the SelectionResult that masks events containing
-    jets from the veto map, which is the recommended way to use the veto map.
-    For users that only want to remove the jets from the veto map, the ``veto_map_jets`` object
-    is added to the SelectionResult.
+    Selector that applies the jet veto map to the jets and stores the result as a new column ``Jet.veto_map_mask``.
+    Additionally, the ``jet_veto_map`` step is added to the SelectionResult that masks events containing jets from the
+    veto map, which is the recommended way to use the veto map.
 
-    Requires an external file in the config
-    under ``jet_veto_map``:
+    A minimal selection is applied to jets that are fed into the veto map check as documented in [1]. However, this
+    recommendation depends on the data taking period and uses either the proximity to muons in the event (run 2), or the
+    so-called "tightLepVeto" (run 3). When *use_lepton_veto_id* is *None*, the decision is based on the ``run``
+    auxiliary field of the campaign of the config. Otherwise, when *True*, the "tightLepVeto" is used.
+
+    Requires an external file in the config under ``jet_veto_map``:
 
     .. code-block:: python
 
@@ -52,32 +52,41 @@ def jet_veto_map(
 
     *get_veto_map_file* can be adapted in a subclass in case it is stored differently in the external files.
 
-    documentation: https://cms-jerc.web.cern.ch/Recommendations/#jet-veto-maps
-    """
-    jet = events.Jet
-    muon = events.Muon[events.Muon.isPFcand]
+    Resources:
 
-    # loose jet selection
+        1. https://cms-jerc.web.cern.ch/Recommendations/#jet-veto-maps
+        2. https://cms-talk.web.cern.ch/t/updated-jet-selection-criterion-for-jet-veto-map/130527
+    """
+    # jet selection
+    jet = events.Jet
     jet_mask = (
         (jet.pt > 15) &
-        (jet.jetId >= 2) &  # tight id
-        (jet.chEmEF < 0.9) &
-        ak.all(events.Jet.metric_table(muon) >= 0.2, axis=2)
+        ((jet.chEmEF + jet.neEmEF) < 0.9)
     )
+
+    # fold in veto id or manually filter against muons
+    if self.use_lepton_veto_id:
+        jet_mask = jet_mask & (jet.jetId & (1 << 2) != 0)  # third bit is tightLepVeto
+    else:
+        muon = events.Muon[events.Muon.isPFcand]
+        jet_mask = jet_mask & (
+            (jet.jetId & (1 << 1) != 0) &  # second bit is tight
+            ak.all(events.Jet.metric_table(muon) >= 0.2, axis=2)
+        )
 
     # apply loose Jet puId in Run 2 to jets with pt below 50 GeV
     if self.config_inst.campaign.x.run == 2:
-        jet_pu_mask = (events.Jet.puId >= 4) | (events.Jet.pt >= 50)
-        jet_mask = jet_mask & jet_pu_mask
-
-    jet_phi = jet.phi
-    jet_eta = jet.eta
+        jet_mask = jet_mask & (
+            (events.Jet.puId >= 4) |
+            (events.Jet.pt >= 50)
+        )
 
     # for some reason, math.pi is not included in the ranges, so we need to subtract a small number
     pi = math.pi - 1e-10
 
     # values outside [-pi, pi] are not included, so we need to clip the phi values
-    phi_outside_range = abs(jet.phi) > pi
+    jet_phi = jet.phi
+    phi_outside_range = abs(jet_phi) > pi
     if ak.any(phi_outside_range):
         # warn in severe cases
         if ak.any(severe := abs(jet_phi[phi_outside_range]) >= 3.15):
@@ -86,23 +95,24 @@ def jet_veto_map(
                 "with phi values outside [-pi, pi] that will be clipped",
             )
         jet_phi = ak.where(
-            np.abs(jet.phi) > pi,
-            jet.phi - 2 * pi * np.sign(jet.phi),
-            jet.phi,
+            np.abs(jet_phi) > pi,
+            jet_phi - 2 * pi * np.sign(jet_phi),
+            jet_phi,
         )
 
     # values outside [-5.19, 5.19] are not included, so we need to clip the eta values
-    eta_outside_range = np.abs(jet.eta) > 5.19
+    jet_eta = jet.eta
+    eta_outside_range = np.abs(jet_eta) > 5.19
     if ak.any(eta_outside_range):
-        jet_eta = ak.where(
-            np.abs(jet.eta) > 5.19,
-            5.19 * np.sign(jet.eta),
-            jet.eta,
-        )
         logger.warning(
-            f"Jet eta values {jet.eta[eta_outside_range][ak.any(eta_outside_range, axis=1)]} outside [-5.19, 5.19] "
-            f"({ak.sum(eta_outside_range)} in total) "
-            f"detected and set to {jet_eta[eta_outside_range][ak.any(eta_outside_range, axis=1)]}",
+            f"jet eta values {jet_eta[eta_outside_range][ak.any(eta_outside_range, axis=1)]} outside [-5.19, 5.19] "
+            f"({ak.sum(eta_outside_range)} in total) detected and set to "
+            f"{jet_eta[eta_outside_range][ak.any(eta_outside_range, axis=1)]}",
+        )
+        jet_eta = ak.where(
+            np.abs(jet_eta) > 5.19,
+            5.19 * np.sign(jet_eta),
+            jet_eta,
         )
 
     # evalute the veto map only for selected jets
@@ -121,9 +131,10 @@ def jet_veto_map(
         inputs = [variable_map[inp.name] for inp in self.veto_map.inputs]
         veto_mask_sel = veto_mask_sel & ~(self.veto_map(*inputs) != 0)
 
-    # insert back into full jet mask in-place
-    flat_jet_mask = flat_np_view(jet_mask)
+    # combine again with jet mask
+    flat_jet_mask = flat_np_view(jet_mask, copy=True)
     flat_jet_mask[flat_jet_mask] = ak.flatten(veto_mask_sel)
+    jet_mask = layout_ak_array(flat_jet_mask, events.Jet)
 
     # store the per-jet veto mask for further processing
     # note: to be consistent with conventions, the exported values should be True for passing jets
@@ -135,6 +146,24 @@ def jet_veto_map(
     )
 
     return events, results
+
+
+@jet_veto_map.init
+def get_veto_map_init(self: Selector) -> None:
+    # get the default for use_lepton_veto_id
+    if self.use_lepton_veto_id is None:
+        self.use_lepton_veto_id = self.config_inst.campaign.x.run == 3
+
+    # always read specific jet columns
+    self.uses.add("Jet.{pt,eta,phi,mass,jetId,chEmEF,neEmEF}")
+
+    # read puId in run 2 for additional cut
+    if self.config_inst.campaign.x.run == 2:
+        self.uses.add("Jet.puId")
+
+    # read muon columns when not using the veto id
+    if not self.use_lepton_veto_id:
+        self.uses.add("Muon.{pt,eta,phi,mass,isPFcand}")
 
 
 @jet_veto_map.requires

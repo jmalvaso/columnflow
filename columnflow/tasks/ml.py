@@ -33,8 +33,6 @@ from columnflow.tasks.framework.decorators import view_output_plots, on_failure
 from columnflow.tasks.reduction import ReducedEventsUser
 from columnflow.tasks.production import ProduceColumns
 from columnflow.util import dev_sandbox, safe_div, DotDict, maybe_import
-from columnflow.columnar_util import set_ak_column
-
 
 ak = maybe_import("awkward")
 
@@ -84,29 +82,28 @@ class PrepareMLEvents(
     def workflow_requires(self):
         reqs = super().workflow_requires()
 
-        # require the full merge forest
-        reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
-
         # add producer dependent requirements
         if self.preparation_producer_inst:
             reqs["preparation_producer"] = self.preparation_producer_inst.run_requires(task=self)
 
-        # add producers to requirements
-        if not self.pilot and self.producer_insts:
-            reqs["producers"] = [
-                self.reqs.ProduceColumns.req(
-                    self,
-                    producer=producer_inst.cls_name,
-                    producer_inst=producer_inst,
-                )
-                for producer_inst in self.producer_insts
-                if producer_inst.produced_columns
-            ]
+        # depending on pilot flag, add upstream workflows or pass-through their own requirements only
+        reqs["producers"] = list(map(self.pilot_workflow_requires, (
+            self.reqs.ProduceColumns.req(
+                self,
+                producer=producer_inst.cls_name,
+                producer_inst=producer_inst,
+            )
+            for producer_inst in self.producer_insts
+            if producer_inst.produced_columns
+        )))
+
+        # require the full merge forest
+        reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
 
         return reqs
 
     def requires(self):
-        reqs = {"events": self.reqs.ProvideReducedEvents.req(self)}
+        reqs = {}
 
         if self.preparation_producer_inst:
             reqs["preparation_producer"] = self.preparation_producer_inst.run_requires(task=self)
@@ -121,6 +118,9 @@ class PrepareMLEvents(
                 for producer_inst in self.producer_insts
                 if producer_inst.produced_columns
             ]
+
+        # require merged events
+        reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
 
         return reqs
 
@@ -145,7 +145,7 @@ class PrepareMLEvents(
     @on_failure(callback=lambda task: task.teardown_preaparation_producer_inst())
     def run(self):
         from columnflow.columnar_util import (
-            Route, RouteFilter, sorted_ak_to_parquet, update_ak_array, add_ak_aliases,
+            Route, RouteFilter, sorted_ak_to_parquet, update_ak_array, add_ak_aliases, set_ak_column,
         )
 
         # prepare inputs and outputs
@@ -627,8 +627,6 @@ class MLEvaluation(
             configs=(self.config_inst.name,),
         )
 
-        reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
-
         # add producer dependent requirements
         if self.preparation_producer_inst:
             reqs["preparation_producer"] = self.preparation_producer_inst.run_requires(task=self)
@@ -644,17 +642,21 @@ class MLEvaluation(
                 if producer_inst.produced_columns
             ]
 
+        # require the full merge forest
+        reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
+
         return reqs
 
     def requires(self):
-        reqs = {
-            "models": self.reqs.MLTraining.req_different_branching(
-                self,
-                configs=(self.config_inst.name,),
-                branch=-1,
-            ),
-            "events": self.reqs.ProvideReducedEvents.req(self, _exclude=self.exclude_params_branch),
-        }
+        reqs = {}
+
+        # add models
+        reqs["models"] = self.reqs.MLTraining.req_different_branching(
+            self,
+            configs=(self.config_inst.name,),
+            branch=-1,
+        )
+
         if self.preparation_producer_inst:
             reqs["preparation_producer"] = self.preparation_producer_inst.run_requires(task=self)
 
@@ -668,6 +670,9 @@ class MLEvaluation(
                 for producer_inst in self.producer_insts
                 if producer_inst.produced_columns
             ]
+
+        # require merged events
+        reqs["events"] = self.reqs.ProvideReducedEvents.req(self, _exclude=self.exclude_params_branch)
 
         return reqs
 
@@ -684,7 +689,7 @@ class MLEvaluation(
     @on_failure(callback=lambda task: task.teardown_preparation_producer_inst())
     def run(self):
         from columnflow.columnar_util import (
-            Route, RouteFilter, sorted_ak_to_parquet, update_ak_array, add_ak_aliases,
+            Route, RouteFilter, sorted_ak_to_parquet, update_ak_array, add_ak_aliases, set_ak_column,
         )
 
         # prepare inputs and outputs
@@ -806,7 +811,12 @@ class MLEvaluation(
         # merge output files
         sorted_chunks = [output_chunks[key] for key in sorted(output_chunks)]
         law.pyarrow.merge_parquet_task(
-            self, sorted_chunks, output["mlcolumns"], local=True, writer_opts=self.get_parquet_writer_opts(),
+            task=self,
+            inputs=sorted_chunks,
+            output=output["mlcolumns"],
+            local=True,
+            writer_opts=self.get_parquet_writer_opts(),
+            target_row_group_size=self.merging_row_group_size,
         )
 
 
@@ -989,6 +999,8 @@ class PlotMLResultsBase(
         :return: dict[str, ak.Array]: A dictionary with the dataset names as keys and
             the corresponding predictions as values.
         """
+        from columnflow.columnar_util import ak_concatenate_safe
+
         category_inst = self.config_inst.get_category(self.branch_data.category)
         leaf_category_insts = category_inst.get_leaf_categories() or [category_inst]
         process_insts = list(map(self.config_inst.get_process, self.processes))
@@ -1006,7 +1018,7 @@ class PlotMLResultsBase(
                     "which is not implemented yet.",
                 )
 
-            events = ak.from_parquet(inp["mlcolumns"].abspath)
+            events = law.awkward.from_parquet(inp["mlcolumns"].abspath)
 
             # masking with leaf categories
             category_mask = False
@@ -1022,7 +1034,7 @@ class PlotMLResultsBase(
 
                 if not self.plot_sub_processes:
                     if process_inst.name in all_events.keys():
-                        all_events[process_inst.name] = ak.concatenate([
+                        all_events[process_inst.name] = ak_concatenate_safe([
                             all_events[process_inst.name], getattr(events, self.ml_model),
                         ])
                     else:
@@ -1039,7 +1051,7 @@ class PlotMLResultsBase(
 
                         process_mask = ak.where(events.process_ids == sub_process.id, True, False)
                         if sub_process.name in all_events.keys():
-                            all_events[sub_process.name] = ak.concatenate([
+                            all_events[sub_process.name] = ak_concatenate_safe([
                                 all_events[sub_process.name],
                                 getattr(events[process_mask], self.ml_model),
                             ])

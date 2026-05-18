@@ -37,6 +37,8 @@ setup_columnflow() {
     #       serves as a default for e.g. $CF_SOFTWARE_BASE, $CF_CMSSW_BASE, $CF_JOB_BASE and
     #       $CF_VENV_BASE which can, however, potentially point to a different directory. Queried
     #       during the interactive setup.
+    #   CF_PYTHON_VERSION
+    #       The python version to use for the conda and venv installations. Defaults to "3.9".
     #   CF_SOFTWARE_BASE
     #       The directory where general software is installed. Might point to $CF_DATA/software.
     #       Queried during the interactive setup.
@@ -376,6 +378,7 @@ cf_setup_interactive_common_variables() {
     query CF_VENV_SETUP_MODE_UPDATE "Automatically update virtual envs if needed" "false"
     [ "${CF_VENV_SETUP_MODE_UPDATE}" != "true" ] && export_and_save CF_VENV_SETUP_MODE "update"
     unset CF_VENV_SETUP_MODE_UPDATE
+    query CF_INTERACTIVE_VENV_FILE "Custom venv setup file to use for interactive work instead of 'cf_dev'" "" "''"
 
     query CF_LOCAL_SCHEDULER "Use a local scheduler for law tasks" "true"
     if [ "${CF_LOCAL_SCHEDULER}" != "true" ]; then
@@ -528,10 +531,16 @@ cf_setup_software_stack() {
     #       The base directory were virtual envs are installed.
     #
     # Optional environments variables:
+    #   CF_PYTHON_VERSION
+    #       The python version for the conda and venv installations. Defaults to "3.9".
     #   CF_REMOTE_ENV
     #       When true-ish, the software stack is sourced but not built.
-    #   CF_CI_ENV
-    #       When true-ish, the "cf" venv is skipped and only the "cf_dev" env is built.
+    #   CF_LOCAL_ENV
+    #       When not true-ish, the context is not meant for local development and only the "cf_dev" venv is built.
+    #       CF_INTERACTIVE_VENV_FILE is ignored in this case.
+    #   CF_INTERACTIVE_VENV_FILE
+    #       IF CF_LOCAL_ENV is true-ish, the venv setup of this file is sourced to start the interactive shell. When
+    #       empty, defaults to ${CF_BASE}/sandboxes/cf_dev.sh.
     #   CF_REINSTALL_SOFTWARE
     #       When true-ish, any existing software stack is removed and freshly installed.
     #   CF_CONDA_ARCH
@@ -557,7 +566,6 @@ cf_setup_software_stack() {
     local setup_name="${1}"
     local setup_is_default="false"
     [ "${setup_name}" = "default" ] && setup_is_default="true"
-    local pyv="${CF_PYTHON_VERSION:-3.9}"
     local conda_arch="${CF_CONDA_ARCH:-linux-64}"
     local ret
 
@@ -566,6 +574,9 @@ cf_setup_software_stack() {
         emulate -L bash
         setopt globdots
     fi
+
+    # default python version
+    export CF_PYTHON_VERSION="${CF_PYTHON_VERSION:-3.9}"
 
     # empty the PYTHONPATH, except for specific customizable paths
     export PYTHONPATH="${CF_INITIAL_PYTHONPATH:-}"
@@ -585,7 +596,7 @@ cf_setup_software_stack() {
     export PYTHONPATH="${CF_PERSISTENT_PYTHONPATH}:${PYTHONPATH}"
 
     # also add the python path of the venv to be installed to propagate changes to any outer venv
-    export CF_CONDA_PYTHONPATH="${CF_CONDA_BASE}/lib/python${pyv}/site-packages"
+    export CF_CONDA_PYTHONPATH="${CF_CONDA_BASE}/lib/python${CF_PYTHON_VERSION}/site-packages"
     export PYTHONPATH="${PYTHONPATH}:${CF_CONDA_PYTHONPATH}"
 
     # update paths and flags
@@ -620,8 +631,8 @@ cf_setup_software_stack() {
         # conda / micromamba setup
         #
 
-        # not needed in CI or RTD jobs
-        if ! ${CF_CI_ENV} && ! ${CF_RTD_ENV}; then
+        # only needed in local envs
+        if ${CF_LOCAL_ENV}; then
             # base environment
             local conda_missing="$( [ -d "${CF_CONDA_BASE}" ] && echo "false" || echo "true" )"
             if ${conda_missing}; then
@@ -650,17 +661,18 @@ EOF
             # initialize micromamba
             source "${CF_CONDA_BASE}/etc/profile.d/micromamba.sh" "" || return "$?"
             micromamba activate || return "$?"
-            echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${pyv}" )"
+            echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${CF_PYTHON_VERSION}" )"
 
             # install packages
             if ${conda_missing}; then
                 echo
                 cf_color cyan "setting up conda / micromamba environment"
                 micromamba install \
+                    gcc \
                     libgcc \
                     bash \
                     zsh \
-                    "python=${pyv}" \
+                    "python=${CF_PYTHON_VERSION}" \
                     git \
                     git-lfs \
                     gfal2 \
@@ -690,32 +702,61 @@ EOF
 
         # - "cf"     : contains the minimal stack to run tasks and is sent alongside jobs
         # - "cf_dev" : "cf" + additional python tools for local development (e.g. ipython)
+        # - custom   : when CF_INTERACTIVE_VENV_FILE is set, source the venv setup from there
 
-        show_version_warning() {
-            >&2 echo
-            >&2 echo "WARNING: your venv '$1' is not up to date, please consider updating it in a new shell with"
-            >&2 echo "WARNING: > CF_REINSTALL_SOFTWARE=1 source setup.sh $( ${setup_is_default} || echo "${setup_name}" )"
-            >&2 echo
-        }
+        source_venv() {
+            # all parameters must be given
+            local venv_file="$1"
+            local venv_name="$2"
+            # must be true or false
+            local use_subshell="$3"
 
-        # source the production sandbox, potentially skipped in CI and RTD jobs
-        if ! ${CF_CI_ENV} && ! ${CF_RTD_ENV}; then
-            ( source "${CF_BASE}/sandboxes/cf.sh" "" "silent" )
-            ret="$?"
+            # source the file and catch the return code
+            local ret="0"
+            if ${use_subshell}; then
+                ( source "${venv_file}" "" "silent" )
+                ret="$?"
+            else
+                source "${venv_file}" "" "silent"
+                ret="$?"
+            fi
+
+            # code 21 means "version outdated", all others are as usual
             if [ "${ret}" = "21" ]; then
-                show_version_warning "cf"
+                >&2 echo
+                >&2 echo "WARNING: your venv '${venv_name}' is not up to date, please consider updating it in a new shell with"
+                >&2 echo "WARNING: > CF_REINSTALL_SOFTWARE=1 source setup.sh $( ${setup_is_default} || echo "${setup_name}" )"
+                >&2 echo
             elif [ "${ret}" != "0" ]; then
                 return "${ret}"
             fi
+
+            return "0"
+        }
+
+        # build the production sandbox in a subshell, only in local envs
+        if ${CF_LOCAL_ENV}; then
+            source_venv "${CF_BASE}/sandboxes/cf.sh" "cf" true || return "$?"
         fi
 
-        # source the dev sandbox
-        source "${CF_BASE}/sandboxes/cf_dev.sh" "" "silent"
-        ret="$?"
-        if [ "${ret}" = "21" ]; then
-            show_version_warning "cf_dev"
-        elif [ "${ret}" != "0" ]; then
-            return "${ret}"
+        # check if a custom interactive venv should be used, check the file, but only in local envs
+        local use_custom_interactive_venv="false"
+        if ${CF_LOCAL_ENV} && [ ! -z "${CF_INTERACTIVE_VENV_FILE}" ]; then
+            # check existence
+            if [ ! -f "${CF_INTERACTIVE_VENV_FILE}" ]; then
+                >&2 echo "the interactive venv setup file ${CF_INTERACTIVE_VENV_FILE} does not exist"
+                return "2"
+            fi
+            use_custom_interactive_venv="true"
+        fi
+
+        # build the dev sandbox, using a subshell if a custom venv is given that should be sourced afterwards
+        source_venv "${CF_BASE}/sandboxes/cf_dev.sh" "cf_dev" "${use_custom_interactive_venv}" || return "$?"
+
+        # source the custom interactive venv setup file if given
+        if ${use_custom_interactive_venv}; then
+            echo "activating custom interactive venv from $( cf_color magenta "${CF_INTERACTIVE_VENV_FILE}" )"
+            source_venv "${CF_INTERACTIVE_VENV_FILE}" "$( basename "${CF_INTERACTIVE_VENV_FILE%.*}" )" false || return "$?"
         fi
 
         # initialze submodules
@@ -735,7 +776,7 @@ EOF
         # initialize conda
         source "${CF_CONDA_BASE}/etc/profile.d/micromamba.sh" "" || return "$?"
         micromamba activate || return "$?"
-        echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${pyv}" )"
+        echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${CF_PYTHON_VERSION}" )"
 
         # source the production sandbox
         source "${CF_BASE}/sandboxes/cf.sh" "" "no"
@@ -756,13 +797,21 @@ cf_setup_post_install() {
     #       Should be true or false, indicating if the setup is run in a local environment.
     #   CF_REPO_BASE
     #       The base directory of the analysis repository, which is used to determine the law home and config file.
+    #
+    # Optional environment variables:
+    #   CF_SKIP_SETUP_GIT_HOOKS
+    #       When set to true, the setup of git hooks is skipped.
+    #   CF_SKIP_LAW_INDEX
+    #       When set to true, the initial indexing of law tasks is skipped.
+    #   CF_SKIP_CHECK_TMP_DIR
+    #       When set to true, the check of the size of the target tmp directory is skipped.
 
     #
     # git hooks
     #
 
     # only in local env
-    if ${CF_LOCAL_ENV}; then
+    if ! ${CF_SKIP_SETUP_GIT_HOOKS} && ${CF_LOCAL_ENV}; then
         cf_setup_git_hooks || return "$?"
     fi
 
@@ -782,7 +831,9 @@ cf_setup_post_install() {
             complete -o bashdefault -o default -F _law_complete claw
 
             # silently index
-            law index -q
+            if ! ${CF_SKIP_LAW_INDEX}; then
+                law index -q
+            fi
         fi
     fi
 
@@ -790,7 +841,7 @@ cf_setup_post_install() {
     # check the tmp directory size
     #
 
-    if ${CF_LOCAL_ENV} && which law &> /dev/null; then
+    if ! ${CF_SKIP_CHECK_TMP_DIR} && ${CF_LOCAL_ENV} && which law &> /dev/null; then
         cf_check_tmp_dir
     fi
 
@@ -816,12 +867,16 @@ cf_check_tmp_dir() {
         >&2 cf_color "red" "cf_check_tmp_dir: 'law config target.tmp_dir' must not be empty"
         return "2"
     elif [ ! -d "${tmp_dir}" ]; then
-        >&2 cf_color "red" "cf_check_tmp_dir: 'law config target.tmp_dir' is not a directory"
-        return "3"
+        # nothing to do
+        return "0"
     fi
 
-    # compute the size
-    local tmp_size="$( find "${tmp_dir}" -maxdepth 1 -name "*" -user "$( id -u )" -exec du -cb {} + | grep 'total$' | cut -d $'\t' -f 1 )"
+    # compute the size, with a notification shown if it takes too long
+    ( sleep 5 && cf_color yellow "computing the size of your files in ${tmp_dir} ..." ) &
+    local msg_pid="$!"
+    local tmp_size="$( find "${tmp_dir}" -maxdepth 1 -user "$( id -u )" -exec du -cb {} + | grep 'total$' | cut -d $'\t' -f 1 | sort | head -n 1 )"
+    kill "${msg_pid}" 2> /dev/null
+    wait "${msg_pid}" 2> /dev/null
 
     # warn above 1GB with color changing when above 2GB
     local thresh1="1073741824"
@@ -1102,6 +1157,9 @@ for flag_name in \
         CF_REINSTALL_SOFTWARE \
         CF_REINSTALL_HOOKS \
         CF_SKIP_BANNER \
+        CF_SKIP_SETUP_GIT_HOOKS \
+        CF_SKIP_LAW_INDEX \
+        CF_SKIP_CHECK_TMP_DIR \
         CF_ON_HTCONDOR \
         CF_ON_SLURM \
         CF_ON_GRID \

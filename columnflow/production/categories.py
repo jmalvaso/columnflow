@@ -6,12 +6,15 @@ Column production methods related defining categories.
 
 from __future__ import annotations
 
+import functools
+import operator
+
 import law
 
 from columnflow.categorization import Categorizer
 from columnflow.production import Producer, producer
 from columnflow.util import maybe_import
-from columnflow.columnar_util import set_ak_column
+from columnflow.columnar_util import set_ak_column, ak_concatenate_safe
 
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
@@ -34,23 +37,27 @@ def category_ids(
     """
     Assigns each event an array of category ids.
     """
+    # evaluate all unique categorizers, storing their returned masks
+    cat_masks = {}
+    for categorizer in self.unique_categorizers:
+        events, mask = self[categorizer](events, **kwargs)
+        cat_masks[categorizer] = mask
+
+    # loop through categories and construct mask over all categorizers
     category_ids = []
-
     for cat_inst, categorizers in self.categorizer_map.items():
-        # start with a true mask
-        cat_mask = np.ones(len(events), dtype=bool)
-
-        # loop through selectors
-        for categorizer in categorizers:
-            events, mask = self[categorizer](events, **kwargs)
-            cat_mask = cat_mask & mask
+        cat_mask = functools.reduce(
+            operator.and_,
+            (cat_masks[c] for c in categorizers),
+            np.ones(len(events), dtype=bool),
+        )
 
         # covert to nullable array with the category ids or none, then apply ak.singletons
         ids = ak.where(cat_mask, np.float64(cat_inst.id), np.float64(np.nan))
         category_ids.append(ak.singletons(ak.nan_to_none(ids)))
 
     # combine
-    category_ids = ak.concatenate(category_ids, axis=1)
+    category_ids = ak_concatenate_safe(category_ids, axis=1)
 
     # save, optionally on a target events array
     if target_events is None:
@@ -95,3 +102,6 @@ def category_ids_init(self: Producer, **kwargs) -> None:
             self.produces.add(categorizer)
 
             self.categorizer_map.setdefault(cat_inst, []).append(categorizer)
+
+    # store a list of unique categorizers
+    self.unique_categorizers = law.util.make_unique(sum(self.categorizer_map.values(), []))

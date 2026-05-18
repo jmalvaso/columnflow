@@ -4,6 +4,8 @@
 Task to unite columns horizontally into a single file for further, possibly external processing.
 """
 
+from __future__ import annotations
+
 import luigi
 import law
 
@@ -13,7 +15,9 @@ from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.reduction import ReducedEventsUser
 from columnflow.tasks.production import ProduceColumns
 from columnflow.tasks.ml import MLEvaluation
+from columnflow.columnar_util import Route
 from columnflow.util import dev_sandbox
+from columnflow.types import Callable
 
 
 class _UniteColumns(
@@ -33,6 +37,12 @@ class UniteColumns(_UniteColumns):
 
     sandbox = dev_sandbox(law.config.get("analysis", "default_columnar_sandbox"))
 
+    keep_columns_key = luigi.Parameter(
+        default=law.NO_STR,
+        description="if the 'keep_columns' auxiliary config entry for the task family 'cf.UniteColumns' is defined as "
+        "a dictionary, this key can selects which of the entries of columns to use; uses all columns when empty; "
+        "default: empty",
+    )
     file_type = luigi.ChoiceParameter(
         default="parquet",
         choices=("parquet", "root"),
@@ -47,33 +57,34 @@ class UniteColumns(_UniteColumns):
         MLEvaluation=MLEvaluation,
     )
 
+    # a column that is evaluated to decide whether to keep or drop an event before writing
+    filter_events: str | Route | Callable | None = None
+
     def workflow_requires(self):
         reqs = super().workflow_requires()
+
+        # depending on pilot flag, add upstream workflows or pass-through their own requirements only
+        reqs["producers"] = list(map(self.pilot_workflow_requires, (
+            self.reqs.ProduceColumns.req(
+                self,
+                producer=producer_inst.cls_name,
+                producer_inst=producer_inst,
+            )
+            for producer_inst in self.producer_insts
+            if producer_inst.produced_columns
+        )))
+        reqs["ml"] = list(map(self.pilot_workflow_requires, (
+            self.reqs.MLEvaluation.req(self, ml_model=m)
+            for m in self.ml_models
+        )))
 
         # require the full merge forest
         reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
 
-        if not self.pilot:
-            if self.producer_insts:
-                reqs["producers"] = [
-                    self.reqs.ProduceColumns.req(
-                        self,
-                        producer=producer_inst.cls_name,
-                        producer_inst=producer_inst,
-                    )
-                    for producer_inst in self.producer_insts
-                    if producer_inst.produced_columns
-                ]
-            if self.ml_model_insts:
-                reqs["ml"] = [
-                    self.reqs.MLEvaluation.req(self, ml_model=m)
-                    for m in self.ml_models
-                ]
-
         return reqs
 
     def requires(self):
-        reqs = {"events": self.reqs.ProvideReducedEvents.req(self)}
+        reqs = {}
 
         if self.producer_insts:
             reqs["producers"] = [
@@ -91,13 +102,17 @@ class UniteColumns(_UniteColumns):
                 for m in self.ml_models
             ]
 
+        # require merged events
+        reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
+
         return reqs
 
     workflow_condition = ReducedEventsUser.workflow_condition.copy()
 
     @workflow_condition.output
     def output(self):
-        return {"events": self.target(f"data_{self.branch}.{self.file_type}")}
+        key_postfix = "" if self.keep_columns_key in {law.NO_STR, "", None} else f"_{self.keep_columns_key}"
+        return {"events": self.target(f"data_{self.branch}{key_postfix}.{self.file_type}")}
 
     @law.decorator.notify
     @law.decorator.log
@@ -105,8 +120,7 @@ class UniteColumns(_UniteColumns):
     @law.decorator.safe_output
     def run(self):
         from columnflow.columnar_util import (
-            Route, RouteFilter, mandatory_coffea_columns, update_ak_array, sorted_ak_to_parquet,
-            sorted_ak_to_root,
+            RouteFilter, mandatory_coffea_columns, update_ak_array, sorted_ak_to_parquet, sorted_ak_to_root,
         )
 
         # prepare inputs and outputs
@@ -121,7 +135,18 @@ class UniteColumns(_UniteColumns):
         # define columns that will be written
         write_columns: set[Route] = set()
         skip_columns: set[Route] = set()
-        for c in self.config_inst.x.keep_columns.get(self.task_family, ["*"]):
+        keep_struct = self.config_inst.x.keep_columns.get(self.task_family, ["*"])
+        if isinstance(keep_struct, dict):
+            if self.keep_columns_key not in {law.NO_STR, "", None}:
+                if self.keep_columns_key not in keep_struct:
+                    raise KeyError(
+                        f"keep_columns_key '{self.keep_columns_key}' not found in keep_columns config entry for "
+                        f"task family '{self.task_family}', existing keys: {list(keep_struct.keys())}",
+                    )
+                keep_struct = keep_struct[self.keep_columns_key]
+            else:
+                keep_struct = law.util.flatten(keep_struct.values())
+        for c in law.util.make_unique(keep_struct):
             for r in self._expand_keep_column(c):
                 if r.has_tag("skip"):
                     skip_columns.add(r)
@@ -152,6 +177,16 @@ class UniteColumns(_UniteColumns):
             # add additional columns
             events = update_ak_array(events, *columns)
 
+            # optionally filter events
+            if self.filter_events:
+                if callable(self.filter_events):
+                    filter_func = self.filter_events
+                else:
+                    r = Route(self.filter_events)
+                    filter_func = r.apply
+                mask = filter_func(events)
+                events = events[mask]
+
             # remove columns
             events = route_filter(events)
 
@@ -174,7 +209,7 @@ class UniteColumns(_UniteColumns):
                 self, sorted_chunks, output["events"], local=True, writer_opts=self.get_parquet_writer_opts(),
             )
         else:  # root
-            law.root.hadd_task(self, sorted_chunks, output["events"], local=True)
+            law.root.hadd_task(self, sorted_chunks, output["events"], local=True, hadd_args=["-O", "-f501"])
 
 
 # overwrite class defaults

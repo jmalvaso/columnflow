@@ -10,17 +10,15 @@ from collections import defaultdict
 import luigi
 import law
 
-from columnflow.types import Any
-
 from columnflow.tasks.framework.base import Requirements, AnalysisTask, wrapper_factory
 from columnflow.tasks.framework.mixins import CalibratorsMixin, SelectorMixin, ChunkedIOMixin, ProducerMixin
 from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.framework.decorators import on_failure
+from columnflow.tasks.framework.parameters import DerivableInstParameter
 from columnflow.tasks.external import GetDatasetLFNs
 from columnflow.tasks.calibration import CalibrateEvents
 from columnflow.util import maybe_import, ensure_proxy, dev_sandbox, safe_div, DotDict
-from columnflow.tasks.framework.parameters import DerivableInstParameter
-
+from columnflow.types import Any
 
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
@@ -71,25 +69,19 @@ class SelectEvents(_SelectEvents):
 
         reqs["lfns"] = self.reqs.GetDatasetLFNs.req(self)
 
-        if not self.pilot:
-            reqs["calibrations"] = [
-                self.reqs.CalibrateEvents.req(
-                    self,
-                    calibrator=calibrator_inst.cls_name,
-                    calibrator_inst=calibrator_inst,
-                )
-                for calibrator_inst in self.calibrator_insts
-                if calibrator_inst.produced_columns
-            ]
-        elif self.calibrator_insts:
-            # pass-through pilot workflow requirements of upstream task
-            t = self.reqs.CalibrateEvents.req(self)
-            reqs = law.util.merge_dicts(reqs, t.workflow_requires(), inplace=True)
+        # depending on pilot flag, add upstream workflows or pass-through their own requirements only
+        reqs["calibrations"] = list(map(self.pilot_workflow_requires, (
+            self.reqs.CalibrateEvents.req(
+                self,
+                calibrator=calibrator_inst.cls_name,
+                calibrator_inst=calibrator_inst,
+            )
+            for calibrator_inst in self.calibrator_insts
+            if calibrator_inst.produced_columns
+        )))
 
         # add selector dependent requirements
-        reqs["selector"] = law.util.make_unique(law.util.flatten(
-            self.selector_inst.run_requires(task=self),
-        ))
+        reqs["selector"] = law.util.make_unique(law.util.flatten(self.selector_inst.run_requires(task=self)))
 
         return reqs
 
@@ -188,13 +180,15 @@ class SelectEvents(_SelectEvents):
         write_columns |= self.selector_inst.produced_columns
         route_filter = RouteFilter(keep=write_columns)
 
-        # let the lfn_task prepare the nano file (basically determine a good pfn)
-        [(lfn_index, input_file)] = lfn_task.iter_nano_files(self)
+        # let the lfn_task locate and prepare the nano file(s)
+        nano_input = [nano_target for _, nano_target in lfn_task.iter_nano_files(self)]
+        if len(nano_input) == 1:
+            nano_input = nano_input[0]
 
         # prepare inputs for localization
         with law.localize_file_targets(
             [
-                input_file,
+                nano_input,
                 *(inp["columns"] for inp in inputs["calibrations"]),
                 *reader_targets.values(),
             ],
@@ -203,7 +197,7 @@ class SelectEvents(_SelectEvents):
             # iterate over chunks of events and diffs
             n_calib = len(inputs["calibrations"])
             for (events, *cols), pos in self.iter_chunked_io(
-                [inp.abspath for inp in inps],
+                law.util.map_struct(law.target.file.get_path, inps),
                 source_type=["coffea_root"] + ["awkward_parquet"] * n_calib + [None] * n_ext,
                 read_columns=[read_columns] * (1 + n_calib + n_ext),
                 chunk_size=self.selector_inst.get_min_chunk_size(),
@@ -241,8 +235,8 @@ class SelectEvents(_SelectEvents):
                     self.raise_if_not_finite(results_array)
 
                 # save results as parquet via a thread in the same pool
-                chunk = tmp_dir.child(f"res_{lfn_index}_{pos.index}.parquet", type="f")
-                result_chunks[(lfn_index, pos.index)] = chunk
+                chunk = tmp_dir.child(f"res_{pos.index}.parquet", type="f")
+                result_chunks[pos.index] = chunk
                 self.chunked_io.queue(sorted_ak_to_parquet, (results_array, chunk.abspath))
 
                 # remove columns
@@ -254,8 +248,8 @@ class SelectEvents(_SelectEvents):
                         self.raise_if_not_finite(events)
 
                     # save additional columns as parquet via a thread in the same pool
-                    chunk = tmp_dir.child(f"cols_{lfn_index}_{pos.index}.parquet", type="f")
-                    column_chunks[(lfn_index, pos.index)] = chunk
+                    chunk = tmp_dir.child(f"cols_{pos.index}.parquet", type="f")
+                    column_chunks[pos.index] = chunk
                     self.chunked_io.queue(sorted_ak_to_parquet, (events, chunk.abspath))
 
         # teardown the selector
@@ -265,14 +259,24 @@ class SelectEvents(_SelectEvents):
         sorted_chunks = [result_chunks[key] for key in sorted(result_chunks)]
         writer_opts_masks = self.get_parquet_writer_opts(repeating_values=True)
         law.pyarrow.merge_parquet_task(
-            self, sorted_chunks, outputs["results"], local=True, writer_opts=writer_opts_masks,
+            task=self,
+            inputs=sorted_chunks,
+            output=outputs["results"],
+            local=True,
+            writer_opts=writer_opts_masks,
+            target_row_group_size=self.merging_row_group_size,
         )
 
         # merge the column files
         if write_columns:
             sorted_chunks = [column_chunks[key] for key in sorted(column_chunks)]
             law.pyarrow.merge_parquet_task(
-                self, sorted_chunks, outputs["columns"], local=True, writer_opts=self.get_parquet_writer_opts(),
+                task=self,
+                inputs=sorted_chunks,
+                output=outputs["columns"],
+                local=True,
+                writer_opts=self.get_parquet_writer_opts(),
+                target_row_group_size=self.merging_row_group_size,
             )
 
         # save stats

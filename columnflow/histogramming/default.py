@@ -6,18 +6,21 @@ Default histogram producers that define columnflow's default behavior.
 
 from __future__ import annotations
 
+import functools
+
 import law
 import order as od
 
 from columnflow.histogramming import HistProducer, hist_producer
-from columnflow.util import maybe_import
-from columnflow.hist_util import create_hist_from_variables, fill_hist, translate_hist_intcat_to_strcat
 from columnflow.columnar_util import has_ak_column, Route
-from columnflow.types import Any
+from columnflow.hist_util import create_hist_from_variables, fill_hist, translate_hist_intcat_to_strcat
+from columnflow.util import maybe_import
+from columnflow.types import TYPE_CHECKING, Any
 
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
-hist = maybe_import("hist")
+if TYPE_CHECKING:
+    hist = maybe_import("hist")
 
 
 @hist_producer()
@@ -39,7 +42,7 @@ def cf_default_create_hist(
     variables: list[od.Variable],
     task: law.Task,
     **kwargs,
-) -> hist.Histogram:
+) -> hist.Hist:
     """
     Define the histogram structure for the default histogram producer.
     """
@@ -55,15 +58,37 @@ def cf_default_create_hist(
 
 
 @cf_default.fill_hist
-def cf_default_fill_hist(self: HistProducer, h: hist.Histogram, data: dict[str, Any], task: law.Task) -> None:
+def cf_default_fill_hist(self: HistProducer, h: hist.Hist, data: dict[str, Any], task: law.Task) -> None:
     """
     Fill the histogram with the data.
     """
+    # in case multiple variable axes are given that refer to data arrays with more than one dimension (i.e. nested),
+    # check if they are broadcasting-compatible since otherwise, the full combinatorics of values would be fille which
+    # is not supported by fill_hist in its default implementation
+    import hist
+
+    var_axes = [
+        ax for ax in h.axes
+        if isinstance(ax, (hist.axis.Variable, hist.axis.Integer)) and ax.name in data and data[ax.name].ndim > 1
+    ]
+    if len(var_axes) > 1:
+        ref_counts = ak.count(data[var_axes[0].name], axis=1)
+        for ax in var_axes[1:]:
+            counts = ak.count(data[ax.name], axis=1)
+            if not ak.all(counts == ref_counts):
+                err = (
+                    "detected multiple variable axes with data to be filled that is not broadcasting-compatible:\n" +
+                    "\n  - ".join(f"{ax.name}: {data[ax.name]}" for ax in var_axes) +
+                    "please use a custom histogram producer whose fill_hist implementation supports the desired "
+                    "filling logic including combinatorics or custom broadcasting"
+                )
+                raise ValueError(err)
+
     fill_hist(h, data, last_edge_inclusive=task.last_edge_inclusive)
 
 
 @cf_default.post_process_hist
-def cf_default_post_process_hist(self: HistProducer, h: hist.Histogram, task: law.Task) -> hist.Histogram:
+def cf_default_post_process_hist(self: HistProducer, h: hist.Hist, task: law.Task) -> hist.Hist:
     """
     Post-process the histogram, converting integer to string axis for consistent lookup across configs where ids might
     be different.
@@ -72,8 +97,10 @@ def cf_default_post_process_hist(self: HistProducer, h: hist.Histogram, task: la
 
     # translate axes
     if "category" in axis_names:
-        category_map = {cat.id: cat.name for cat in self.config_inst.get_leaf_categories()}
-        h = translate_hist_intcat_to_strcat(h, "category", category_map)
+        @functools.cache
+        def get_category_name(cat_id: int) -> str:
+            return self.config_inst.get_category(cat_id).name
+        h = translate_hist_intcat_to_strcat(h, "category", get_category_name)
     if "process" in axis_names:
         process_map = {proc_id: self.config_inst.get_process(proc_id).name for proc_id in h.axes["process"]}
         h = translate_hist_intcat_to_strcat(h, "process", process_map)

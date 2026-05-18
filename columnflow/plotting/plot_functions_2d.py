@@ -6,13 +6,17 @@ Example 2d plot functions.
 
 from __future__ import annotations
 
+__all__ = []
+
 from collections import OrderedDict
 from functools import partial
 from unittest.mock import patch
 
 import law
+import order as od
 
 from columnflow.util import maybe_import
+from columnflow.hist_util import sum_hists
 from columnflow.plotting.plot_util import (
     remove_residual_axis,
     apply_variable_settings,
@@ -22,14 +26,11 @@ from columnflow.plotting.plot_util import (
     get_position,
     reduce_with,
 )
+from columnflow.types import TYPE_CHECKING
 
-hist = maybe_import("hist")
 np = maybe_import("numpy")
-mpl = maybe_import("matplotlib")
-plt = maybe_import("matplotlib.pyplot")
-mplhep = maybe_import("mplhep")
-od = maybe_import("order")
-mticker = maybe_import("matplotlib.ticker")
+if TYPE_CHECKING:
+    plt = maybe_import("matplotlib.pyplot")
 
 
 def plot_2d(
@@ -55,6 +56,10 @@ def plot_2d(
     variable_settings: dict | None = None,
     **kwargs,
 ) -> plt.Figure:
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    import mplhep
+
     # remove shift axis from histograms
     hists = remove_residual_axis(hists, "shift")
 
@@ -77,7 +82,7 @@ def plot_2d(
         extremes = "color"
 
     # add all processes into 1 histogram
-    h_sum = sum(list(hists.values())[1:], list(hists.values())[0].copy())
+    h_sum = sum_hists(hists.values())
     if shape_norm:
         h_sum = h_sum / h_sum.sum().value
 
@@ -168,7 +173,8 @@ def plot_2d(
             "loc": "upper right",
         },
         "cms_label_cfg": {
-            "lumi": round(0.001 * config_inst.x.luminosity.get("nominal"), 2),  # /pb -> /fb
+            "lumi": round(0.001 * config_inst.x.luminosity.get("nominal"), 1),  # /pb -> /fb
+            "com": config_inst.campaign.ecm,
         },
         "plot2d_cfg": {
             "norm": cbar_norm,
@@ -272,10 +278,10 @@ def plot_2d(
             _scale = cbar.ax.yaxis._scale
             _scale.subs = [2, 3, 4, 5, 6, 7, 8, 9]
             cbar.ax.yaxis.set_minor_locator(
-                mticker.SymmetricalLogLocator(_scale.get_transform(), subs=_scale.subs),
+                mpl.ticker.SymmetricalLogLocator(_scale.get_transform(), subs=_scale.subs),
             )
             cbar.ax.yaxis.set_minor_formatter(
-                mticker.LogFormatterSciNotation(_scale.base),
+                mpl.ticker.LogFormatterSciNotation(_scale.base),
             )
 
     plt.tight_layout()

@@ -10,7 +10,6 @@ __all__ = []
 
 import order as od
 
-from columnflow.types import Sequence
 from columnflow.util import maybe_import, try_float
 from columnflow.config_util import group_shifts
 from columnflow.plotting.plot_util import (
@@ -21,12 +20,12 @@ from columnflow.plotting.plot_util import (
     apply_label_placeholders,
     calculate_stat_error,
 )
+from columnflow.types import TYPE_CHECKING, Sequence
 
-hist = maybe_import("hist")
 np = maybe_import("numpy")
-mpl = maybe_import("matplotlib")
-plt = maybe_import("matplotlib.pyplot")
-mplhep = maybe_import("mplhep")
+if TYPE_CHECKING:
+    hist = maybe_import("hist")
+    plt = maybe_import("matplotlib.pyplot")
 
 
 def draw_stat_error_bands(
@@ -71,6 +70,8 @@ def draw_syst_error_bands(
     method: str = "quadratic_sum",
     **kwargs,
 ) -> None:
+    import hist
+
     assert len(h.axes) == 1
     assert method in ("quadratic_sum", "envelope")
 
@@ -80,13 +81,14 @@ def draw_syst_error_bands(
 
     # create pairs of shifts mapping from up -> down and vice versa
     shift_pairs = {}
+    shift_pairs[nominal_shift] = nominal_shift  # nominal shift maps to itself
     for up_shift, down_shift in shift_groups.values():
         shift_pairs[up_shift] = down_shift
         shift_pairs[down_shift] = up_shift
 
     # stack histograms separately per shift, falling back to the nominal one when missing
     shift_stacks: dict[od.Shift, hist.Hist] = {}
-    for shift_inst in sum(shift_groups.values(), []):
+    for shift_inst in sum(shift_groups.values(), [nominal_shift]):
         for _h in syst_hists:
             # when the shift is present, the flipped shift must exist as well
             shift_ax = _h.axes["shift"]
@@ -119,8 +121,8 @@ def draw_syst_error_bands(
         down_diffs = []
         for source, (up_shift, down_shift) in shift_groups.items():
             # get actual differences resulting from this shift
-            shift_up_diff = shift_stacks[up_shift].values()[b] - h.values()[b]
-            shift_down_diff = shift_stacks[down_shift].values()[b] - h.values()[b]
+            shift_up_diff = shift_stacks[up_shift].values()[b] - shift_stacks[nominal_shift].values()[b]
+            shift_down_diff = shift_stacks[down_shift].values()[b] - shift_stacks[nominal_shift].values()[b]
             # store them depending on whether they really increase or decrease the yield
             up_diffs.append(max(shift_up_diff, shift_down_diff, 0))
             down_diffs.append(min(shift_up_diff, shift_down_diff, 0))
@@ -168,6 +170,8 @@ def draw_stack(
     norm: float | Sequence | np.ndarray = 1.0,
     **kwargs,
 ) -> None:
+    import hist
+
     # check if norm is a number
     if try_float(norm):
         h = hist.Stack(*[i / norm for i in h])
@@ -201,6 +205,8 @@ def draw_hist(
     error_type: str = "variance",
     **kwargs,
 ) -> None:
+    import hist
+
     assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
 
     if kwargs.get("color", "") is None:
@@ -242,6 +248,8 @@ def draw_profile(
     """
     Profiled histograms contains the storage type "Mean" and can therefore not be normalized
     """
+    import hist
+
     assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
 
     if kwargs.get("color", "") is None:
@@ -269,8 +277,11 @@ def draw_errorbars(
     h: hist.Hist,
     norm: float | Sequence | np.ndarray = 1.0,
     error_type: str = "poisson_unweighted",
+    density: bool = False,
     **kwargs,
 ) -> None:
+    import hist
+
     assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
 
     values = h.values() / norm
@@ -291,7 +302,7 @@ def draw_errorbars(
                 "Error bars calculation only implemented for histograms with storage type WeightedSum "
                 "either change the Histogram storage_type or set yerr manually",
             )
-        yerr = calculate_stat_error(h, error_type)
+        yerr = calculate_stat_error(h, error_type, density=density)
         # normalize yerr to the histogram = error propagation on standard deviation
         yerr = abs(yerr / norm)
         # replace inf with nan for any bin where norm = 0 and calculate_stat_error returns a non zero value
@@ -341,20 +352,31 @@ def plot_all(
     :param magnitudes: Optional float parameter that defines the displayed ymin when plotting with a logarithmic scale.
     :return: tuple of plot figure and axes
     """
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    import mplhep
+
     # general mplhep style
     plt.style.use(mplhep.style.CMS)
+
+    # use non-interactive Agg backend for plotting
+    mpl.use("Agg")
 
     # setup figure and axes
     rax = None
     grid_spec = {"left": 0.15, "right": 0.95, "top": 0.95, "bottom": 0.1}
     grid_spec |= style_config.get("gridspec_cfg", {})
+
+    # Get figure size from style_config, with default values
+    subplots_cfg = style_config.get("subplots_cfg", {})
+
     if not skip_ratio:
         grid_spec = {"height_ratios": [3, 1], "hspace": 0, **grid_spec}
-        fig, axs = plt.subplots(2, 1, gridspec_kw=grid_spec, sharex=True)
+        fig, axs = plt.subplots(2, 1, gridspec_kw=grid_spec, sharex=True, **subplots_cfg)
         (ax, rax) = axs
     else:
         grid_spec.pop("height_ratios", None)
-        fig, ax = plt.subplots(gridspec_kw=grid_spec)
+        fig, ax = plt.subplots(gridspec_kw=grid_spec, **subplots_cfg)
         axs = (ax,)
 
     # invoke all plots methods
@@ -369,25 +391,29 @@ def plot_all(
         # check if required fields are present
         if "method" not in cfg:
             raise ValueError(f"no method given in plot_cfg entry {key}")
-        if "hist" not in cfg:
-            raise ValueError(f"no histogram(s) given in plot_cfg entry {key}")
 
         # invoke the method
         method = cfg["method"]
-        h = cfg["hist"]
-        plot_methods[method](ax, h, **cfg.get("kwargs", {}))
+        method_func = method if callable(method) else plot_methods[method]
+        args = (ax, cfg["hist"]) if "hist" in cfg else (ax,)
+        method_func(*args, **cfg.get("kwargs", {}))
 
         # repeat for ratio axes if configured
         if not skip_ratio and "ratio_kwargs" in cfg:
             # take ratio_method if the ratio plot requires a different plotting method
             method = cfg.get("ratio_method", method)
-            plot_methods[method](rax, h, **cfg.get("ratio_kwargs", {}))
+            method_func = method if callable(method) else plot_methods[method]
+            args = (rax, cfg["hist"]) if "hist" in cfg else (rax,)
+            method_func(*args, **cfg.get("ratio_kwargs", {}))
 
     # axis styling
     ax_kwargs = {
         "ylabel": "Counts",
         "xlabel": "variable",
         "yscale": "linear",
+        "xticklabelformat": {"style": "sci", "useMathText": True},
+        "yticklabelformat": {"style": "sci", "useMathText": True},
+        "yoffsettext": {"horizontalalignment": "right", "fontsize": 18},
     }
 
     # some default ylim settings based on yscale
@@ -412,6 +438,7 @@ def plot_all(
             "ylabel": "Ratio",
             "xlabel": "Variable",
             "yscale": "linear",
+            "xticklabelformat": {"style": "sci", "useMathText": True},
         }
         rax_kwargs.update(style_config.get("rax_cfg", {}))
 

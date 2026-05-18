@@ -9,6 +9,7 @@ from __future__ import annotations
 __all__ = []
 
 import re
+import math
 import operator
 import functools
 from collections import OrderedDict
@@ -17,15 +18,14 @@ import law
 import order as od
 import scinum as sn
 
-from columnflow.util import maybe_import, try_int, try_complex, UNSET
-from columnflow.hist_util import copy_axis
-from columnflow.types import Iterable, Any, Callable, Sequence, Hashable
+from columnflow.util import maybe_import, try_int, try_complex, safe_div, UNSET
+from columnflow.hist_util import copy_axis, sum_hists
+from columnflow.types import TYPE_CHECKING, Iterable, Any, Callable, Sequence, Hashable
 
-math = maybe_import("math")
-hist = maybe_import("hist")
 np = maybe_import("numpy")
-plt = maybe_import("matplotlib.pyplot")
-mplhep = maybe_import("mplhep")
+if TYPE_CHECKING:
+    hist = maybe_import("hist")
+    plt = maybe_import("matplotlib.pyplot")
 
 
 logger = law.logger.get_logger(__name__)
@@ -224,7 +224,7 @@ def apply_process_scaling(hists: dict[Hashable, hist.Hist]) -> dict[Hashable, hi
         if scale_factor == "stack":
             # compute the scale factor and round
             h_no_shift = remove_residual_axis_single(h, "shift", select_value="nominal")
-            scale_factor = round_dynamic(get_stack_integral() / h_no_shift.sum().value) or 1
+            scale_factor = round_dynamic(safe_div(get_stack_integral(), h_no_shift.sum().value)) or 1
         if try_int(scale_factor):
             scale_factor = int(scale_factor)
             hists[proc_inst] = h * scale_factor
@@ -255,6 +255,8 @@ def apply_variable_settings(
     applies settings from *variable_settings* dictionary to the *variable_insts*;
     the *rebin*, *overflow*, *underflow*, and *slice* settings are directly applied to the histograms
     """
+    import hist
+
     # store info gathered along application of variable settings that can be inserted to the style config
     variable_style_config = {}
 
@@ -312,6 +314,15 @@ def apply_variable_settings(
                 raise ValueError(f"unknown x transformation '{trafo}'")
 
     return hists, variable_style_config
+
+
+def remove_negative_contributions(hists: dict[Hashable, hist.Hist]) -> dict[Hashable, hist.Hist]:
+    _hists = hists.copy()
+    for proc_inst, h in hists.items():
+        h = h.copy()
+        h.view().value[h.view().value < 0] = 0
+        _hists[proc_inst] = h
+    return _hists
 
 
 def use_flow_bins(
@@ -373,12 +384,12 @@ def apply_density(hists: dict, density: bool = True) -> dict:
     if not density:
         return hists
 
-    for key, hist in hists.items():
+    for key, h in hists.items():
         # bin area safe for multi-dimensional histograms
-        area = functools.reduce(operator.mul, hist.axes.widths)
+        area = functools.reduce(operator.mul, h.axes.widths)
 
         # scale hist by bin area
-        hists[key] = hist / area
+        hists[key] = h / area
 
     return hists
 
@@ -389,6 +400,8 @@ def remove_residual_axis_single(
     max_bins: int = 1,
     select_value: Any = None,
 ) -> hist.Hist:
+    import hist
+
     # force always returning a copy
     h = h.copy()
 
@@ -455,10 +468,23 @@ def prepare_style_config(
     # unit format on axes (could be configurable)
     unit_format = "{title} [{unit}]"
 
+    if density:
+        ylabel = variable_inst.get_full_y_title(
+            bin_width=False,
+            unit=variable_inst.unit or "unit",
+            unit_format="{title} / {unit}",
+        )
+    else:
+        ylabel = variable_inst.get_full_y_title(
+            bin_width=False,
+            unit=False,
+            unit_format=unit_format,
+        )
+
     style_config = {
         "ax_cfg": {
             "xlim": xlim,
-            "ylabel": variable_inst.get_full_y_title(bin_width=False, unit=False, unit_format=unit_format),
+            "ylabel": ylabel,
             "xlabel": variable_inst.get_full_x_title(unit_format=unit_format),
             "yscale": yscale,
             "xscale": "log" if variable_inst.log_x else "linear",
@@ -494,6 +520,7 @@ def prepare_stack_plot_config(
     shape_norm: bool | None = False,
     hide_stat_errors: bool | None = None,
     shift_insts: Sequence[od.Shift] | None = None,
+    density: bool = False,
     **kwargs,
 ) -> OrderedDict:
     """
@@ -501,6 +528,8 @@ def prepare_stack_plot_config(
     backgrounds with uncertainty bands, unstacked processes as lines and
     data entrys with errorbars.
     """
+    import hist
+
     # separate histograms into stack, lines and data hists
     mc_hists, mc_colors, mc_edgecolors, mc_labels = [], [], [], []
     mc_syst_hists = []
@@ -533,17 +562,19 @@ def prepare_stack_plot_config(
 
     h_data, h_mc, h_mc_stack = None, None, None
     if data_hists:
-        h_data = sum(data_hists[1:], data_hists[0].copy())
+        h_data = sum_hists(data_hists)
     if mc_hists:
-        h_mc = sum(mc_hists[1:], mc_hists[0].copy())
+        h_mc = sum_hists(mc_hists)
         h_mc_stack = hist.Stack(*mc_hists)
 
     # setup plotting configs
     plot_config = OrderedDict()
 
+    shape_norm_func = kwargs.get("shape_norm_func", lambda h, shape_norm: sum(h.values()) if shape_norm else 1)
+
     # draw stack
     if h_mc_stack is not None:
-        mc_norm = sum(h_mc.values()) if shape_norm else 1
+        mc_norm = shape_norm_func(h_mc, shape_norm)
         plot_config["mc_stack"] = {
             "method": "draw_stack",
             "hist": h_mc_stack,
@@ -558,7 +589,7 @@ def prepare_stack_plot_config(
 
     # draw lines
     for i, h in enumerate(line_hists):
-        line_norm = sum(h.values()) if shape_norm else 1
+        line_norm = shape_norm_func(h, shape_norm)
         plot_config[f"line_{i}"] = plot_cfg = {
             "method": "draw_hist",
             "hist": h,
@@ -582,7 +613,7 @@ def prepare_stack_plot_config(
 
     # draw statistical error for stack
     if h_mc_stack is not None and not hide_stat_errors:
-        mc_norm = sum(h_mc.values()) if shape_norm else 1
+        mc_norm = shape_norm_func(h_mc, shape_norm)
         plot_config["mc_stat_unc"] = {
             "method": "draw_stat_error_bands",
             "hist": h_mc,
@@ -592,7 +623,7 @@ def prepare_stack_plot_config(
 
     # draw systematic error for stack
     if h_mc_stack is not None and mc_syst_hists:
-        mc_norm = sum(h_mc.values()) if shape_norm else 1
+        mc_norm = shape_norm_func(h_mc, shape_norm)
         plot_config["mc_syst_unc"] = {
             "method": "draw_syst_error_bands",
             "hist": h_mc,
@@ -611,7 +642,7 @@ def prepare_stack_plot_config(
 
     # draw data
     if data_hists:
-        data_norm = sum(h_data.values()) if shape_norm else 1
+        data_norm = shape_norm_func(h_data, shape_norm)
         plot_config["data"] = plot_cfg = {
             "method": "draw_errorbars",
             "hist": h_data,
@@ -619,6 +650,7 @@ def prepare_stack_plot_config(
                 "norm": data_norm,
                 "label": data_label or "Data",
                 "error_type": "poisson_unweighted",
+                "density": density,
             },
         }
 
@@ -626,6 +658,7 @@ def prepare_stack_plot_config(
             plot_config["data"]["ratio_kwargs"] = {
                 "norm": h_mc.values() * data_norm / mc_norm,
                 "error_type": "poisson_unweighted",
+                "density": density,
             }
 
         # suppress error bars by overriding `yerr`
@@ -645,7 +678,8 @@ def split_ax_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
     set_kwargs, other_kwargs = {}, {}
     other_keys = {
         "xmajorticks", "xminorticks", "xmajorticklabels", "xminorticklabels", "xloc", "xrotation",
-        "ymajorticks", "yminorticks", "yloc", "yrotation","grid"
+        "ymajorticks", "yminorticks", "yloc", "yrotation", "xticklabelformat", "yticklabelformat",
+        "xoffsettext", "yoffsettext",
     }
     for key, value in kwargs.items():
         (other_kwargs if key in other_keys else set_kwargs)[key] = value
@@ -684,8 +718,24 @@ def apply_ax_kwargs(ax: plt.Axes, kwargs: dict[str, Any]) -> None:
         ax.tick_params(axis="x", labelrotation=other_kwargs.get("xrotation"))
     if other_kwargs.get("yrotation") is not None:
         ax.tick_params(axis="y", labelrotation=other_kwargs.get("yrotation"))
-    if other_kwargs.get("grid") is not None:
-        ax.grid(**other_kwargs.get("grid"))
+    if other_kwargs.get("xticklabelformat") is not None:
+        _kwargs = other_kwargs["xticklabelformat"].copy()
+        if not callable(getattr(ax.xaxis.major.formatter, "set_scientific", None)):
+            if _kwargs.get("style") == "sci":
+                _kwargs.pop("style")
+                _kwargs.pop("useMathText", None)
+        ax.ticklabel_format(axis="x", **_kwargs)
+    if other_kwargs.get("yticklabelformat") is not None:
+        _kwargs = other_kwargs["yticklabelformat"].copy()
+        if not callable(getattr(ax.yaxis.major.formatter, "set_scientific", None)):
+            if _kwargs.get("style") == "sci":
+                _kwargs.pop("style")
+                _kwargs.pop("useMathText", None)
+        ax.ticklabel_format(axis="y", **_kwargs)
+    if other_kwargs.get("xoffsettext") is not None:
+        ax.xaxis.get_offset_text().set(**other_kwargs["xoffsettext"])
+    if other_kwargs.get("yoffsettext") is not None:
+        ax.yaxis.get_offset_text().set(**other_kwargs["yoffsettext"])
 
 
 def get_position(minimum: float, maximum: float, factor: float = 1.4, logscale: bool = False) -> float:
@@ -910,7 +960,7 @@ def blind_sensitive_bins(
 
     # set data points in masked region to zero
     for proc, h in data.items():
-        h.values()[..., mask] = 0
+        h.values()[..., mask] = -999
         h.variances()[..., mask] = 0
 
     # merge all histograms
@@ -932,6 +982,8 @@ def rebin_equal_width(
     :param axis_name: Name of the axis to rebin.
     :return: Tuple of the rebinned histograms and the new bin edges.
     """
+    import hist
+
     # get the variable axis from the first histogram
     assert hists
     for var_index, var_axis in enumerate(list(hists.values())[0].axes):
@@ -1027,28 +1079,34 @@ def remove_label_placeholders(
     return re.sub(f"__{sel}__", "", label)
 
 
-def calculate_stat_error(
-    hist: hist.Hist,
-    error_type: str,
-) -> dict:
+def calculate_stat_error(h: hist.Hist, error_type: str, density: bool = True) -> np.ndarray:
     """
-    Calculate the error to be plotted for the given histogram *hist*.
+    Calculate the error to be plotted for the given histogram *h*.
     Supported error types are:
-        - 'variance': the plotted error is the square root of the variance for each bin
-        - 'poisson_unweighted': the plotted error is the poisson error for each bin
-        - 'poisson_weighted': the plotted error is the poisson error for each bin, weighted by the variance
+
+        - "variance": the plotted error is the square root of the variance for each bin
+        - "poisson_unweighted": the plotted error is the poisson error for each bin
+        - "poisson_weighted": the plotted error is the poisson error for each bin, weighted by the variance
     """
+    # undo density if needed
+    if density:
+        area = functools.reduce(operator.mul, h.axes.widths)
+        h = h * area
 
     # determine the error type
     if error_type == "variance":
-        yerr = hist.view().variance ** 0.5
+        yerr = h.view().variance ** 0.5
+
     elif error_type in {"poisson_unweighted", "poisson_weighted"}:
         # compute asymmetric poisson confidence interval
         from hist.intervals import poisson_interval
 
-        variances = hist.view().variance if error_type == "poisson_weighted" else None
-        values = hist.view().value
+        variances = h.view().variance if error_type == "poisson_weighted" else None
+        values = h.view().value
         confidence_interval = poisson_interval(values, variances)
+
+        # negative values are considerd as blinded bins -> set confidence interval to 0
+        confidence_interval[:, values < 0] = 0
 
         if error_type == "poisson_weighted":
             # might happen if some bins are empty, see https://github.com/scikit-hep/hist/blob/5edbc25503f2cb8193cc5ff1eb71e1d8fa877e3e/src/hist/intervals.py#L74  # noqa: E501
@@ -1057,20 +1115,21 @@ def calculate_stat_error(
             raise ValueError("Unweighted Poisson interval calculation returned NaN values, check Hist package")
 
         # calculate the error
-        # yerr_lower is the lower error
         yerr_lower = values - confidence_interval[0]
-        # yerr_upper is the upper error
         yerr_upper = confidence_interval[1] - values
-        # yerr is the size of the errorbars to be plotted
         yerr = np.array([yerr_lower, yerr_upper])
 
         if np.any(yerr < 0):
-            logger.warning(
-                "yerr < 0, setting to 0. "
-                "This should not happen, please check your histogram.",
-            )
+            logger.warning("found yerr < 0, forcing to 0; this should not happen, please check your histogram")
             yerr[yerr < 0] = 0
+
     else:
         raise ValueError(f"unknown error type '{error_type}'")
+
+    # re-apply density if needed
+    if density:
+        area = functools.reduce(operator.mul, h.axes.widths)
+        h = h / area
+        yerr = yerr / area
 
     return yerr

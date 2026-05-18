@@ -143,14 +143,14 @@ class AnalysisTaskTests(unittest.TestCase):
             groups_str="producer_groups",
             multi_strategy="first",
         )
-        self.assertEqual(resolved_producer_groups, ("b", "a", "B", "d", "c"))  # TODO: order reversed
+        self.assertEqual(resolved_producer_groups, ("a", "b", "B", "c", "d"))
 
         # multi config
         for multi_strategy, expected_producer in (
             ("all", {self.config_inst1: ("A", "B", "C"), self.config_inst2: ("B", "C", "D")}),
             ("first", ("A", "B", "C")),
-            ("union", ("A", "B", "C", "D")),
-            ("intersection", ("B", "C")),
+            ("union", ["A", "B", "C", "D"]),
+            ("intersection", ["B", "C"]),
         ):
             resolved_producer = AnalysisTask.resolve_config_default(
                 param=(RESOLVE_DEFAULT,),
@@ -159,8 +159,7 @@ class AnalysisTaskTests(unittest.TestCase):
                 default_str="default_producer",
                 multi_strategy=multi_strategy,
             )
-            # TODO: remove set() when order is fixed
-            self.assertEqual(set(resolved_producer), set(expected_producer))
+            self.assertEqual(resolved_producer, expected_producer)
 
         # "same" strategy
         resolved_calibrator = AnalysisTask.resolve_config_default(
@@ -231,8 +230,7 @@ class AnalysisTaskTests(unittest.TestCase):
                 "categories": input_categories,
             }
             resolved_params = CategoriesMixin.modify_param_values(params=input_params)
-            # TODO: remove set() when order is fixed
-            self.assertEqual(set(resolved_params["categories"]), set(expected_categories))
+            self.assertEqual(resolved_params["categories"], expected_categories)
 
     def test_resolve_variables(self):
         # testing with single config
@@ -247,8 +245,7 @@ class AnalysisTaskTests(unittest.TestCase):
                 "variables": input_variables,
             }
             resolved_params = VariablesMixin.modify_param_values(params=input_params)
-            # TODO: remove set() when order is fixed
-            self.assertEqual(set(resolved_params["variables"]), set(expected_variables))
+            self.assertEqual(resolved_params["variables"], expected_variables)
 
     def test_resolve_datasets_processes(self):
         DatasetsProcessesMixin.single_config = False

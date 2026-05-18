@@ -71,7 +71,8 @@
       "profile": "https://github.com/Bogdan-Wiederspan",
       "contributions": [
         "code",
-        "test"
+        "test",
+        "review"
       ]
     },
     {
@@ -153,13 +154,42 @@
       "avatar_url": "https://avatars.githubusercontent.com/u/99343616?v=4",
       "profile": "https://github.com/aalvesan",
       "contributions": [
-        "code"
+        "code",
+        "review"
       ]
-    }, {
+    },
+    {
       "login": "philippgadow",
       "name": "philippgadow",
       "avatar_url": "https://avatars.githubusercontent.com/u/6804366?v=4",
       "profile": "https://github.com/philippgadow",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "LuSchaller",
+      "name": "Lukas Schaller",
+      "avatar_url": "https://avatars.githubusercontent.com/u/30951523?v=4",
+      "profile": "https://github.com/LuSchaller",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "Lara813",
+      "name": "lamarkus",
+      "avatar_url": "https://avatars.githubusercontent.com/u/67378765?v=4",
+      "profile": "https://github.com/Lara813",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "LennertGriesing",
+      "name": "Lennert Griesing",
+      "avatar_url": "https://avatars.githubusercontent.com/u/115483673?v=4",
+      "profile": "https://github.com/LennertGriesing",
       "contributions": [
         "code"
       ]

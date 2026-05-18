@@ -6,9 +6,9 @@ Column production methods related to Drell-Yan reweighting.
 
 from __future__ import annotations
 
-import law
+import dataclasses
 
-from dataclasses import dataclass
+import law
 
 from columnflow.production import Producer, producer
 from columnflow.util import maybe_import, load_correction_set
@@ -16,26 +16,34 @@ from columnflow.columnar_util import set_ak_column
 
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
-vector = maybe_import("vector")
+
 
 logger = law.logger.get_logger(__name__)
 
 
-@dataclass
+@dataclasses.dataclass
 class DrellYanConfig:
+    # era, e.g. "2022preEE"
     era: str
-    order: str
+    # correction set name
     correction: str
-    unc_correction: str
+    # uncertainty correction set name
+    unc_correction: str | None = None
+    # generator order
+    order: str | None = None
+    # list of systematics to be considered
+    systs: list[str] | None = None
+    # functions to get the number of jets and b-tagged jets from the events in case they should be used as inputs
+    get_njets: callable[["dy_weights", ak.Array], ak.Array] | None = None
+    get_nbtags: callable[["dy_weights", ak.Array], ak.Array] | None = None
+    # additional columns to be loaded, e.g. as needed for njets or nbtags
+    used_columns: set = dataclasses.field(default_factory=set)
 
     def __post_init__(self) -> None:
-        if (
-            not self.era or
-            not self.order or
-            not self.correction or
-            not self.unc_correction
-        ):
-            raise ValueError("incomplete dy_weight_config: missing era, order, correction or unc_correction")
+        if not self.era or not self.correction:
+            raise ValueError(f"{self.__class__.__name__}: missing era or correction")
+        if self.unc_correction and not self.order:
+            raise ValueError(f"{self.__class__.__name__}: when unc_correction is defined, order must be set")
 
 
 @producer(
@@ -58,7 +66,7 @@ def gen_dilepton(self, events: ak.Array, **kwargs) -> ak.Array:
         (status == 1) &
         events.GenPart.hasFlags("fromHardProcess")
     )
-    # taus need to have status == 2,
+    # taus need to have status == 2
     tau_mask = (
         (pdg_id == 15) & (status == 2) & events.GenPart.hasFlags("fromHardProcess")
     )
@@ -131,12 +139,13 @@ def dy_weights(self: Producer, events: ak.Array, **kwargs) -> ak.Array:
     .. code-block:: python
 
         cfg.x.external_files = DotDict.wrap({
-            "dy_weight_sf": "/afs/cern.ch/work/m/mrieger/public/mirrors/external_files/DY_pTll_weights_v2.json.gz",  # noqa
+            "dy_weight_sf": "/afs/cern.ch/work/m/mrieger/public/mirrors/external_files/hbt_corrections.json.gz",  # noqa
         })
 
     *get_dy_weight_file* can be adapted in a subclass in case it is stored differently in the external files.
 
-    The campaign era and name of the correction set (see link above) should be given as an auxiliary entry in the config:
+    The analysis config should contain an auxiliary entry *dy_weight_config* pointing to a :py:class:`DrellYanConfig`
+    object:
 
     .. code-block:: python
 
@@ -149,49 +158,71 @@ def dy_weights(self: Producer, events: ak.Array, **kwargs) -> ak.Array:
 
     *get_dy_weight_config* can be adapted in a subclass in case it is stored differently in the config.
     """
-
     # map the input variable names from the corrector to our columns
     variable_map = {
         "era": self.dy_config.era,
-        "order": self.dy_config.order,
         "ptll": events.gen_dilepton_pt,
     }
 
-    # initializing the list of weight variations
-    weights_list = [("dy_weight", "nom")]
+    # optionals
+    if self.dy_config.order:
+        variable_map["order"] = self.dy_config.order
+    if callable(self.dy_config.get_njets):
+        variable_map["njets"] = self.dy_config.get_njets(self, events)
+    if callable(self.dy_config.get_nbtags):
+        variable_map["ntags"] = self.dy_config.get_nbtags(self, events)
 
-    # appending the respective number of uncertainties to the weight list
-    for i in range(self.n_unc):
-        for shift in ("up", "down"):
-            tmp_tuple = (f"dy_weight{i + 1}_{shift}", f"{shift}{i + 1}")
-            weights_list.append(tmp_tuple)
+    # initializing the list of weight variations (called syst in the dy files)
+    systs = []
+
+    # add specific uncertainties or additional systs
+    if self.dy_config.unc_correction:
+        systs.append(("nom", ""))
+        for i in range(self.n_unc):
+            for direction in ["up", "down"]:
+                systs.append((f"{direction}{i + 1}", f"_{direction}{i + 1}"))
+    elif self.dy_config.systs:
+        systs.append(("nominal", ""))
+        for syst in self.dy_config.systs:
+            systs.append((syst, f"_{syst}"))
 
     # preparing the input variables for the corrector
-    for column_name, syst in weights_list:
-        variable_map_syst = {**variable_map, "syst": syst}
+    for syst, postfix in systs:
+        _variable_map = {**variable_map, "syst": syst}
 
         # evaluating dy weights given a certain era, ptll array and sytematic shift
-        inputs = [variable_map_syst[inp.name] for inp in self.dy_corrector.inputs]
+        inputs = [_variable_map[inp.name] for inp in self.dy_corrector.inputs]
         dy_weight = self.dy_corrector.evaluate(*inputs)
 
         # save the weights in a new column
-        events = set_ak_column(events, column_name, dy_weight, value_type=np.float32)
+        events = set_ak_column(events, f"dy_weight{postfix}", dy_weight, value_type=np.float32)
 
     return events
 
 
 @dy_weights.init
 def dy_weights_init(self: Producer) -> None:
-    # the number of weights in partial run 3 is always 10
-    if self.config_inst.campaign.x.year not in {2022, 2023}:
+    if self.config_inst.campaign.x.year not in {2022, 2023, 2024}:
         raise NotImplementedError(
             f"campaign year {self.config_inst.campaign.x.year} is not yet supported by {self.cls_name}",
         )
-    self.n_unc = 10
 
-    # register dynamically produced weight columns
-    for i in range(self.n_unc):
-        self.produces.add(f"dy_weight{i + 1}_{{up,down}}")
+    # get the dy weight config
+    self.dy_config: DrellYanConfig = self.get_dy_weight_config()
+
+    # declare additional used columns
+    if self.dy_config.used_columns:
+        self.uses.update(self.dy_config.used_columns)
+
+    # declare additional produced columns
+    if self.dy_config.unc_correction:
+        # the number should always be 10
+        self.n_unc = 10
+        for i in range(self.n_unc):
+            self.produces.add(f"dy_weight{i + 1}_{{up,down}}")
+    elif self.dy_config.systs:
+        for syst in self.dy_config.systs:
+            self.produces.add(f"dy_weight_{syst}")
 
 
 @dy_weights.requires
@@ -215,31 +246,26 @@ def dy_weights_setup(
     reader_targets: law.util.InsertableDict,
 ) -> None:
     """
-    Loads the Drell-Yan weight calculator from the external files bundle and saves them in the
-    py:attr:`dy_corrector` attribute for simpler access in the actual callable. The number of uncertainties
-    is calculated, per era, by another correcter in the external file and is saved in the
-    py:attr:`dy_unc_corrector` attribute.
+    Loads the Drell-Yan weight calculator from the external files bundle and saves them in the py:attr:`dy_corrector`
+    attribute for simpler access in the actual callable. The number of uncertainties is calculated, per era, by another
+    correcter in the external file and is saved in the py:attr:`dy_unc_corrector` attribute.
     """
     bundle = reqs["external_files"]
 
     # import all correctors from the external file
     correction_set = load_correction_set(self.get_dy_weight_file(bundle.files))
 
-    # check number of fetched correctors
-    if len(correction_set.keys()) != 2:
-        raise Exception("Expected exactly two types of Drell-Yan correction")
-
-    # create the weight and uncertainty correctors
-    self.dy_config: DrellYanConfig = self.get_dy_weight_config()
+    # create the weight corrector
     self.dy_corrector = correction_set[self.dy_config.correction]
-    self.dy_unc_corrector = correction_set[self.dy_config.unc_correction]
 
-    dy_n_unc = int(self.dy_unc_corrector.evaluate(self.dy_config.order))
-
-    if dy_n_unc != self.n_unc:
-        raise ValueError(
-            f"Expected {self.n_unc} uncertainties, got {dy_n_unc}",
-        )
+    # create the uncertainty corrector
+    if self.dy_config.unc_correction:
+        self.dy_unc_corrector = correction_set[self.dy_config.unc_correction]
+        dy_n_unc = int(self.dy_unc_corrector.evaluate(self.dy_config.order))
+        if dy_n_unc != self.n_unc:
+            raise ValueError(
+                f"Expected {self.n_unc} uncertainties, got {dy_n_unc}",
+            )
 
 
 @producer(
@@ -247,8 +273,6 @@ def dy_weights_setup(
         # MET information
         # -> only Run 3 (PuppiMET) is supported
         "PuppiMET.{pt,phi}",
-        # Number of jets (as a per-event scalar)
-        "Jet.{pt,phi,eta,mass}",
         # Gen-level boson information (full boson momentum)
         # -> gen_dilepton_vis.pt, gen_dilepton_vis.phi, gen_dilepton_all.pt, gen_dilepton_all.phi
         gen_dilepton.PRODUCES,
@@ -257,6 +281,8 @@ def dy_weights_setup(
         "RecoilCorrMET.{pt,phi}",
         "RecoilCorrMET.{pt,phi}_{recoilresp,recoilres}_{up,down}",
     },
+    # custom njet column to be used to derive corrections
+    njet_column=None,
     mc_only=True,
     # function to determine the recoil correction file from external files
     get_dy_recoil_file=(lambda self, external_files: external_files.dy_recoil_sf),
@@ -291,6 +317,8 @@ def recoil_corrected_met(self: Producer, events: ak.Array, **kwargs) -> ak.Array
 
     *get_dy_recoil_config* can be adapted in a subclass in case it is stored differently in the config.
     """
+    import vector
+
     # steps:
     # 1) Build transverse vectors for MET and the generator-level boson (full and visible).
     # 2) Compute the recoil vector U = MET + vis - full in the transverse plane.
@@ -331,12 +359,15 @@ def recoil_corrected_met(self: Producer, events: ak.Array, **kwargs) -> ak.Array
     uperp = -u_x * full_unit_y + u_y * full_unit_x
 
     # Determine jet multiplicity for the event (jet selection as in original)
-    jet_selection = (
-        ((events.Jet.pt > 30) & (np.abs(events.Jet.eta) < 2.5)) |
-        ((events.Jet.pt > 50) & (np.abs(events.Jet.eta) >= 2.5))
-    )
-    selected_jets = events.Jet[jet_selection]
-    njet = np.asarray(ak.num(selected_jets, axis=1), dtype=np.float32)
+    if self.njet_column:
+        njet = np.asarray(events[self.njet_column], dtype=np.float32)
+    else:
+        jet_selection = (
+            ((events.Jet.pt > 30) & (np.abs(events.Jet.eta) < 2.5)) |
+            ((events.Jet.pt > 50) & (np.abs(events.Jet.eta) >= 2.5))
+        )
+        selected_jets = events.Jet[jet_selection]
+        njet = np.asarray(ak.num(selected_jets, axis=1), dtype=np.float32)
 
     # Apply nominal recoil correction on U components
     # (see here: https://cms-higgs-leprare.docs.cern.ch/htt-common/V_recoil/#example-snippet)
@@ -416,6 +447,14 @@ def recoil_corrected_met(self: Producer, events: ak.Array, **kwargs) -> ak.Array
         events = set_ak_column(events, f"RecoilCorrMET.phi_{postfix}", met_var_phi, value_type=np.float32)
 
     return events
+
+
+@recoil_corrected_met.init
+def recoil_corrected_met_init(self: Producer) -> None:
+    if self.njet_column:
+        self.uses.add(f"{self.njet_column}")
+    else:
+        self.uses.add("Jet.{pt,eta,phi,mass}")
 
 
 @recoil_corrected_met.requires

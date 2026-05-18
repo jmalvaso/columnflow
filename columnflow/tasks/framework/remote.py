@@ -22,6 +22,12 @@ from columnflow.util import UNSET, real_path
 from columnflow.types import Any
 
 
+# helpers to join paths relative to some base directories
+_cf_path = lambda *p: os.path.join(os.environ["CF_BASE"], *map(str, p))
+_repo_path = lambda *p: os.path.join(os.environ["CF_REPO_BASE"], *map(str, p))
+_cf_repo_path = lambda *p: [_cf_path(*p), _repo_path(*p)]
+
+
 class BundleRepo(AnalysisTask, law.git.BundleGitRepository, law.tasks.TransferLocalFile):
 
     replicas = luigi.IntParameter(
@@ -32,20 +38,28 @@ class BundleRepo(AnalysisTask, law.git.BundleGitRepository, law.tasks.TransferLo
     version = None
 
     exclude_files = [
-        "docs",
-        "tests",
-        "data",
-        "assets",
-        ".law",
-        ".setups",
-        ".data",
-        ".github",
-        # also make sure that CF specific files that are not part of
-        # the repository are excluded
+        # excluded from cf _and_ analysis repos
+        *_cf_repo_path("docs"),
+        *_cf_repo_path("tests"),
+        *_cf_repo_path("data"),
+        *_cf_repo_path("tmp"),
+        *_cf_repo_path(".data"),
+        *_cf_repo_path(".github"),
+        # excluded from cf repo
+        _cf_path("assets"),
+        # excluded from analysis repo
+        _repo_path(".law", "cms"),
+        _repo_path(".setups"),
+        # also make sure that CF specific files that are not part of the repository are excluded
         os.environ["CF_STORE_LOCAL"],
         os.environ["CF_SOFTWARE_BASE"],
         os.environ["CF_VENV_BASE"],
         os.environ["CF_CONDA_BASE"],
+    ]
+
+    include_files = [
+        _repo_path("law_user.cfg"),
+        _repo_path(".law"),
     ]
 
     def get_repo_path(self):
@@ -342,12 +356,24 @@ class SchedulerMessageHandler:
             )
 
 
+_default_remove_claw_sandbox = law.config.get_expanded("analysis", "default_remote_claw_sandbox", None) or law.NO_STR
+
+
 class RemoteWorkflowMixin(AnalysisTask):
     """
     Mixin class for custom remote workflows adding common functionality.
     """
 
+    remote_claw_sandbox = luigi.Parameter(
+        default=_default_remove_claw_sandbox,
+        significant=False,
+        description="the name of a non-dev sandbox to use in remote jobs for the 'claw' executable rather than using "
+        f"using 'law' directly; not used when empty; default: {_default_remove_claw_sandbox}",
+    )
+
     skip_destination_info: bool = False
+
+    exclude_params_req = {"remote_claw_sandbox"}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -375,17 +401,19 @@ class RemoteWorkflowMixin(AnalysisTask):
     def get_config_lookup_keys(
         cls,
         inst_or_params: RemoteWorkflowMixin | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the pilot flag
-        pilot = (
-            inst_or_params.get("pilot")
-            if isinstance(inst_or_params, dict)
-            else getattr(inst_or_params, "pilot", None)
-        )
-        if pilot not in (law.NO_STR, None, ""):
-            keys["pilot"] = f"pilot_{pilot}"
+        if not significant:
+            pilot = (
+                inst_or_params.get("pilot")
+                if isinstance(inst_or_params, dict)
+                else getattr(inst_or_params, "pilot", None)
+            )
+            if pilot not in (law.NO_STR, None, ""):
+                keys["pilot"] = f"pilot_{pilot}"
 
         return keys
 
@@ -465,7 +493,7 @@ class RemoteWorkflowMixin(AnalysisTask):
         :param config: The job :py:class:`law.BaseJobFileFactory.Config` whose render variables
             should be set.
         """
-        join_bash = lambda seq: " ".join(map('"{}"'.format, seq))
+        join_bash = lambda seq: " ".join(map(str, seq))
 
         def get_bundle_info(task):
             uris = task.output().dir.uri(base_name="filecopy", return_all=True)
@@ -543,15 +571,23 @@ class RemoteWorkflowMixin(AnalysisTask):
                 )
 
         # forward voms proxy
-        if voms and not law.config.get_expanded_boolean("analysis", "skip_ensure_proxy", False):
+        if voms:
+            # when skipping the check, still send it if the proxy exists and is valid, otherwise enforce it
+            skip_check = law.config.get_expanded_boolean("analysis", "skip_ensure_proxy", False)
             vomsproxy_file = law.wlcg.get_vomsproxy_file()
-            if not law.wlcg.check_vomsproxy_validity(proxy_file=vomsproxy_file):
-                raise Exception("voms proxy not valid, submission aborted")
-            config.input_files["vomsproxy_file"] = law.JobInputFile(
-                vomsproxy_file,
-                share=True,
-                render=False,
-            )
+            vomsproxy_exists = os.path.isfile(vomsproxy_file)
+            vomsproxy_valid = vomsproxy_exists and law.wlcg.check_vomsproxy_validity(proxy_file=vomsproxy_file)
+            if not skip_check:
+                if not vomsproxy_exists:
+                    raise Exception(f"voms proxy '{vomsproxy_file}' does not exist, submission aborted")
+                if not vomsproxy_valid:
+                    raise Exception(f"voms proxy '{vomsproxy_file}' not valid, submission aborted")
+            if vomsproxy_valid:
+                config.input_files["vomsproxy_file"] = law.JobInputFile(
+                    vomsproxy_file,
+                    share=True,
+                    render=False,
+                )
 
         # forward kerberos proxy
         if kerberos and "KRB5CCNAME" in os.environ:
@@ -575,6 +611,14 @@ class RemoteWorkflowMixin(AnalysisTask):
                 share=True,
                 render=False,
             )
+
+        # claw sandbox
+        if self.remote_claw_sandbox not in {None, "", law.NO_STR}:
+            if self.remote_claw_sandbox.endswith("_dev"):
+                raise ValueError(
+                    f"remote_claw_sandbox must not refer to a dev sandbox, got '{self.remote_claw_sandbox}'",
+                )
+            config.render_variables["law_exe"] = f"CLAW_SANDBOX='{self.remote_claw_sandbox}' claw"
 
     def common_destination_info(self, info: dict[str, str]) -> dict[str, str]:
         """
@@ -640,6 +684,11 @@ _default_htcondor_disk = law.util.parse_bytes(
     input_unit="GB",
     unit="GB",
 )
+_default_htcondor_runtime = law.util.parse_duration(
+    law.config.get_expanded("analysis", "htcondor_runtime", 3.0),
+    input_unit="h",
+    unit="h",
+)
 
 
 class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
@@ -649,11 +698,11 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         significant=False,
         description="transfer job logs to the output directory; default: True",
     )
-    max_runtime = law.DurationParameter(
-        default=2.0,
+    htcondor_runtime = law.DurationParameter(
+        default=_default_htcondor_runtime,
         unit="h",
         significant=False,
-        description="maximum runtime; default unit is hours; default: 2",
+        description=f"maximum runtime; default unit is hours; default: {_default_htcondor_runtime}",
     )
     htcondor_logs = luigi.BoolParameter(
         default=False,
@@ -707,12 +756,12 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
 
     # parameters that should not be passed to a workflow required upstream
     exclude_params_req_set = {
-        "max_runtime", "htcondor_cpus", "htcondor_gpus", "htcondor_memory", "htcondor_disk",
+        "htcondor_runtime", "htcondor_cpus", "htcondor_gpus", "htcondor_memory", "htcondor_disk",
     }
 
     # parameters that should not be passed from workflow to branches
     exclude_params_branch = {
-        "max_runtime", "htcondor_logs", "htcondor_cpus", "htcondor_gpus", "htcondor_memory",
+        "htcondor_runtime", "htcondor_logs", "htcondor_cpus", "htcondor_gpus", "htcondor_memory",
         "htcondor_disk", "htcondor_flavor", "htcondor_share_software",
     }
 
@@ -724,7 +773,11 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         "CF_STORE_NAME": "cf_store_name",
         "CF_STORE_LOCAL": "cf_store_local",
         "CF_LOCAL_SCHEDULER": "cf_local_scheduler",
+        "CF_PYTHON_VERSION": "cf_python_version",
     }
+
+    # whether to show a memory summary histogram after workflow completion
+    show_memory_summary_hist = True
 
     # upstream requirements
     reqs = Requirements(
@@ -742,7 +795,7 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         self.bundle_repo_req = self.reqs.BundleRepo.req(self)
 
         # add scheduler message handlers
-        self.add_message_handler("max_runtime")
+        self.add_message_handler("htcondor_runtime")
         self.add_message_handler("htcondor_logs")
         self.add_message_handler("htcondor_cpus")
         self.add_message_handler("htcondor_gpus")
@@ -800,6 +853,8 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
             batch_name += f"_{info['config']}"
         if "dataset" in info:
             batch_name += f"_{info['dataset']}"
+        if "shift" in info:
+            batch_name += f"_{info['shift']}"
         config.custom_content.append(("batch_name", batch_name))
 
         # CERN settings, https://batchdocs.web.cern.ch/local/submit.html#os-selection-via-containers
@@ -820,8 +875,8 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
                 config.custom_content.append(("Request_OpSysAndVer", "\"RedHat9\""))
 
         # maximum runtime, compatible with multiple batch systems
-        if self.max_runtime is not None and self.max_runtime > 0:
-            max_runtime = int(math.floor(self.max_runtime * 3600)) - 1
+        if self.htcondor_runtime is not None and self.htcondor_runtime > 0:
+            max_runtime = int(math.floor(self.htcondor_runtime * 3600)) - 1
             config.custom_content.append(("+MaxRuntime", max_runtime))
             config.custom_content.append(("+RequestRuntime", max_runtime))
 
@@ -837,6 +892,7 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
 
         # request memory
         if self.htcondor_memory is not None and self.htcondor_memory > 0:
+            config.custom_content.append(("RequestMemory", f"{self.htcondor_memory} Gb"))
             config.custom_content.append(("Request_Memory", f"{self.htcondor_memory} Gb"))
 
         # request disk space
@@ -854,8 +910,9 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
             "cf_remote_lcg_setup_force",
             "1" if law.config.get_expanded_bool("job", "remote_lcg_setup_force") else "",
         )
-        if self.htcondor_share_software:
-            config.render_variables["cf_software_base"] = os.environ["CF_SOFTWARE_BASE"]
+        config.render_variables["cf_htcondor_share_software"] = str(self.htcondor_share_software).lower()
+        config.render_variables["cf_conda_base"] = os.environ["CF_CONDA_BASE"]
+        config.render_variables["cf_venv_base"] = os.environ["CF_VENV_BASE"]
 
         # forward env variables
         for ev, rv in self.htcondor_forward_env_variables.items():
@@ -872,9 +929,23 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         info = self.common_destination_info(info)
         return info
 
+    def htcondor_post_poll_callback(self, success, duration, summary_kwargs=None):
+        from law.workflow.remote import log_job_memory_summary
+
+        # prepare kwargs to forward
+        summary_kwargs = summary_kwargs or {}
+        summary_kwargs.setdefault("use_uniplot", self.show_memory_summary_hist)
+
+        log_job_memory_summary(self.workflow_proxy.job_data, log=self.logger.info, **summary_kwargs)
+
 
 _default_slurm_flavor = law.config.get_expanded("analysis", "slurm_flavor", "maxwell")
 _default_slurm_partition = law.config.get_expanded("analysis", "slurm_partition", "cms-uhh")
+_default_slurm_runtime = law.util.parse_duration(
+    law.config.get_expanded("analysis", "slurm_runtime", 3.0),
+    input_unit="h",
+    unit="h",
+)
 
 
 class SlurmWorkflow(RemoteWorkflowMixin, law.slurm.SlurmWorkflow):
@@ -884,11 +955,11 @@ class SlurmWorkflow(RemoteWorkflowMixin, law.slurm.SlurmWorkflow):
         significant=False,
         description="transfer job logs to the output directory; default: True",
     )
-    max_runtime = law.DurationParameter(
-        default=2.0,
+    slurm_runtime = law.DurationParameter(
+        default=_default_slurm_runtime,
         unit="h",
         significant=False,
-        description="maximum runtime; default unit is hours; default: 2",
+        description=f"maximum runtime; default unit is hours; default: {_default_slurm_runtime}",
     )
     slurm_partition = luigi.Parameter(
         default=_default_slurm_partition,
@@ -904,10 +975,10 @@ class SlurmWorkflow(RemoteWorkflowMixin, law.slurm.SlurmWorkflow):
     )
 
     # parameters that should not be passed to a workflow required upstream
-    exclude_params_req_set = {"max_runtime"}
+    exclude_params_req_set = {"slurm_runtime"}
 
     # parameters that should not be passed from workflow to branches
-    exclude_params_branch = {"max_runtime", "slurm_partition", "slurm_flavor"}
+    exclude_params_branch = {"slurm_runtime", "slurm_partition", "slurm_flavor"}
 
     # mapping of environment variables to render variables that are forwarded
     slurm_forward_env_variables = {
@@ -917,6 +988,7 @@ class SlurmWorkflow(RemoteWorkflowMixin, law.slurm.SlurmWorkflow):
         "CF_STORE_NAME": "cf_store_name",
         "CF_STORE_LOCAL": "cf_store_local",
         "CF_LOCAL_SCHEDULER": "cf_local_scheduler",
+        "CF_PYTHON_VERSION": "cf_python_version",
     }
 
     # upstream requirements
@@ -959,9 +1031,9 @@ class SlurmWorkflow(RemoteWorkflowMixin, law.slurm.SlurmWorkflow):
         )
 
         # set job time
-        if self.max_runtime is not None:
+        if self.slurm_runtime is not None and self.slurm_runtime > 0:
             job_time = law.util.human_duration(
-                seconds=int(math.floor(self.max_runtime * 3600)) - 1,
+                seconds=int(math.floor(self.slurm_runtime * 3600)) - 1,
                 colon_format=True,
             )
             config.custom_content.append(("time", job_time))

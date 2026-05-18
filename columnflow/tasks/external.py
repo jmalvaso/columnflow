@@ -10,17 +10,19 @@ import os
 import time
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+import dataclasses
+import copy
 
 import luigi
 import law
 import order as od
 
+from columnflow import env_is_local
 from columnflow.tasks.framework.base import AnalysisTask, ConfigTask, DatasetTask, wrapper_factory
 from columnflow.tasks.framework.parameters import user_parameter_inst
 from columnflow.tasks.framework.decorators import only_local_env
 from columnflow.util import wget, DotDict
-from columnflow.types import Sequence
+from columnflow.types import Sequence, ClassVar
 
 
 logger = law.logger.get_logger(__name__)
@@ -176,8 +178,8 @@ class GetDatasetLFNs(DatasetTask, law.tasks.TransferLocalFile):
         :param lfn_indices: List of indices of LFNs that are processed by this *task* instance, defaults to None
         :param eager_lookup: Look at the next fs if stat takes too long, defaults to 1
         :param skip_fallback: Skip the fallback mechanism to fetch the LFN, defaults to False
-        :raises TypeError: If *task* is not of type :external+law:py:class:`~law.workflow.base.BaseWorkflow` or not
-            a task analyzing a single branch in the task tree
+        :raises TypeError: If *task* is not of type :external+law:py:class:`~law.workflow.base.BaseWorkflow` or not a
+            task analyzing a single branch in the task tree
         :raises Exception: If current task is not complete as indicated with ``self.complete()``
         :raises ValueError: If no fs is provided at call and none can be found in either the config instance or the law
             config.
@@ -212,8 +214,6 @@ class GetDatasetLFNs(DatasetTask, law.tasks.TransferLocalFile):
 
         # loop
         for lfn_index in lfn_indices:
-            task.publish_message(f"handling file {lfn_index}")
-
             # get the lfn of the file referenced by this file index
             lfn = str(lfns[lfn_index])
 
@@ -246,7 +246,7 @@ class GetDatasetLFNs(DatasetTask, law.tasks.TransferLocalFile):
                 input_stat = input_file.exists(stat=True)
                 duration = time.perf_counter() - t1
                 i += 1
-                logger.info(f"lfn {lfn} does{'' if input_stat else ' not'} exist at fs {selected_fs}")
+                logger.info(f"lfn {lfn} (lfn {lfn_index}) does{'' if input_stat else ' not'} exist at fs {selected_fs}")
 
                 # when the stat query took longer than some duration, eagerly try the next fs
                 # and check if it responds faster and if so, take it instead
@@ -272,16 +272,15 @@ class GetDatasetLFNs(DatasetTask, law.tasks.TransferLocalFile):
                 # stop when the stat was successful at this point
                 if input_stat:
                     task.publish_message(
-                        f"using fs {selected_fs}, stat responded in "
-                        f"{law.util.human_duration(seconds=duration)}",
+                        f"using fs {selected_fs}, stat responded in {law.util.human_duration(seconds=duration)}",
                     )
                     break
             else:
-                raise Exception(f"lfn {lfn} not found at any remote fs {fs}")
+                raise Exception(f"lfn {lfn} (lfn {lfn_index}) not found at any remote fs {fs}")
 
             # log the file size
             input_size = law.util.human_bytes(input_stat.st_size, fmt=True)
-            task.publish_message(f"lfn {lfn}, size is {input_size}")
+            task.publish_message(f"lfn {lfn} (lfn {lfn_index}), size is {input_size}")
 
             yield (lfn_index, input_file)
 
@@ -368,7 +367,7 @@ Wrapper task to get LFNs for multiple datasets.
 )
 
 
-@dataclass
+@dataclasses.dataclass
 class ExternalFile:
     """
     Container object to define an external file resource that is understood by (e.g.)
@@ -384,12 +383,11 @@ class ExternalFile:
     """
 
     location: str
-    subpaths: dict[str, str] = field(default_factory=str)
+    subpaths: dict[str, str] = dataclasses.field(default_factory=dict)
     version: str = "v1"
 
-    def __str__(self) -> str:
-        sub = (" / " + ",".join(f"{n}={p}" for n, p in self.subpaths.items())) if self.subpaths else ""
-        return f"{self.location}{sub} ({self.version})"
+    single: bool = dataclasses.field(init=False, default=False)
+    single_key: ClassVar[str] = "_single_key"
 
     @classmethod
     def new(cls, resource: ExternalFile | str | tuple[str] | tuple[str, str]) -> ExternalFile:
@@ -408,6 +406,34 @@ class ExternalFile:
                 return cls(location=resource[0], version=resource[1])
         raise ValueError(f"invalid resource type and format: {resource}")
 
+    def __post_init__(self) -> None:
+        # convert different types of subpaths to dict
+        if isinstance(self.subpaths, str):
+            self.subpaths = DotDict({self.single_key: self.subpaths})
+            self.single = True
+        elif isinstance(self.subpaths, (list, tuple)):
+            self.subpaths = DotDict(zip(enumerate(self.subpaths)))
+        else:
+            self.subpaths = DotDict.wrap(copy.deepcopy(self.subpaths))
+        # remove None's
+        for key in list(self.subpaths.keys()):
+            if self.subpaths[key] is None:
+                del self.subpaths[key]
+
+    def __str__(self) -> str:
+        sub = ""
+        if self.subpaths:
+            if self.single:
+                sub = f"/{self.subpaths[self.single_key]}"
+            else:
+                sub = " / " + ",".join(f"{n}={p}" for n, p in self.subpaths.items())
+        return f"{self.location}{sub} ({self.version})"
+
+    def __getattr__(self, attr: str) -> str:
+        if attr in self.subpaths:
+            return self.subpaths[attr]
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{attr}'")
+
 
 class BundleExternalFiles(ConfigTask, law.tasks.TransferLocalFile):
     """
@@ -416,8 +442,8 @@ class BundleExternalFiles(ConfigTask, law.tasks.TransferLocalFile):
     This task is intended to download source files for other tasks, such as files containing corrections for objects,
     the "golden" json files, source files for the calculation of pileup weights, and others.
 
-    All information about the relevant external files is extracted from the given ``config_inst``, which must contain
-    the keyword ``external_files`` in the auxiliary information. This can look like this:
+    All information about the relevant external files is extracted from the given ``config_inst``, which must contain an
+    auxiliary field ``external_files`` like the following (all entries are optional and user-defined):
 
     .. code-block:: python
 
@@ -432,7 +458,7 @@ class BundleExternalFiles(ConfigTask, law.tasks.TransferLocalFile):
             "electron_sf": ExternalFile(f"{SOURCE_URL}/POG/EGM/{year}{corr_postfix}_UL/electron.json.gz", version="v1"),
         })
 
-    The entries in this DotDict should be :py:class:`ExternalFile` instances.
+    All entries should be :py:class:`ExternalFile` instances.
     """
 
     single_config = True
@@ -440,6 +466,11 @@ class BundleExternalFiles(ConfigTask, law.tasks.TransferLocalFile):
     replicas = luigi.IntParameter(
         default=5,
         description="number of replicas to generate; default: 5",
+    )
+    recreate = luigi.BoolParameter(
+        default=False,
+        significant=False,
+        description="when True, forces the recreation of the bundle even if it exists; default: False",
     )
     user = user_parameter_inst
     version = None
@@ -457,23 +488,20 @@ class BundleExternalFiles(ConfigTask, law.tasks.TransferLocalFile):
         self._file_names = None
 
         # cached dict for lazy access to files in fetched bundle
-        self.files_dir = None
-        self._files = None
+        self._files_collection = None
 
     @classmethod
     def create_unique_basename(cls, path: str | ExternalFile) -> str | dict[str, str]:
-        """
-        Create a unique basename for a given path. When *path* is an :py:class:`ExternalFile` with one or more subpaths
-        defined, a dictionary mapping subpaths to unique basenames is returned.
-
-        :param path: path or external file object.
-        :return: Unique basename(s).
-        """
         if isinstance(path, str):
             return f"{law.util.create_hash(path)}_{os.path.basename(path)}"
 
         # path must be an ExternalFile
         if path.subpaths:
+            # single mode
+            if path.single:
+                return cls.create_unique_basename(os.path.join(path.location, path.subpaths[path.single_key]))
+
+            # multiple subpaths
             return type(path.subpaths)(
                 (name, cls.create_unique_basename(os.path.join(path.location, subpath)))
                 for name, subpath in path.subpaths.items()
@@ -483,11 +511,6 @@ class BundleExternalFiles(ConfigTask, law.tasks.TransferLocalFile):
 
     @property
     def files_hash(self) -> str:
-        """
-        Create a hash based on all external files.
-
-        :return: Hash based on the flattened list of external files in the current config instance.
-        """
         if self._files_hash is None:
             # take the external files and flatten them into a deterministic order, then hash
             def deterministic_flatten(d):
@@ -502,117 +525,178 @@ class BundleExternalFiles(ConfigTask, law.tasks.TransferLocalFile):
 
     @property
     def file_names(self) -> DotDict:
-        """
-        Create a unique basename for each external file.
-
-        :return: DotDict of same shape as ``external_files`` DotDict with unique basenames.
-        """
         if self._file_names is None:
             self._file_names = law.util.map_struct(self.create_unique_basename, self.ext_files)
 
         return self._file_names
 
-    def get_files(self, output=None):
-        if self._files is None:
+    def get_files_collection(self, output=None) -> law.SiblingFileCollection:
+        if self._files_collection is None:
             # get the output
             if not output:
                 output = self.output()
-            if not output.exists():
+            if not output["local_files"].exists():
                 raise Exception(
-                    f"accessing external files from the bundle requires the output of {self} to "
-                    "exist, but it appears to be missing",
+                    f"accessing external files from the bundle requires the output of {self} to exist, but it appears "
+                    "to be missing",
                 )
-            if isinstance(output, law.FileCollection):
-                output = output.random_target()
-            self.files_dir = law.LocalDirectoryTarget(is_tmp=True)
-            output.load(self.files_dir, formatter="tar")
+            self._files_collection = output["local_files"]
 
-            # resolve basenames in the bundle directory and map to local targets
-            def resolve_basename(unique_basename):
-                return self.files_dir.child(unique_basename)
-
-            self._files = law.util.map_struct(resolve_basename, self.file_names)
-
-        return self._files
+        return self._files_collection
 
     @property
-    def files(self):
-        return self.get_files()
+    def files(self) -> DotDict:
+        return self.get_files_collection().targets
+
+    @property
+    def files_dir(self) -> law.LocalDirectoryTarget:
+        return self.get_files_collection().dir
 
     def single_output(self):
         # required by law.tasks.TransferLocalFile
         return self.target(f"externals_{self.files_hash}.tgz")
 
-    @only_local_env
+    def output(self):
+        def local_target(basename):
+            path = os.path.join(f"externals_{self.files_hash}", basename)
+            is_dir = "." not in basename  # simple heuristic, but type actually checked after unpacking below
+            return self.local_target(path, dir=is_dir)
+
+        return DotDict(
+            bundle=super().output(),
+            local_files=law.SiblingFileCollection(law.util.map_struct(local_target, self.file_names)),
+        )
+
+    def trace_transfer_output(self, output):
+        return output["bundle"]
+
     @law.decorator.notify
     @law.decorator.log
-    @law.decorator.safe_output
     def run(self):
-        # create a tmp dir to work in
-        tmp_dir = law.LocalDirectoryTarget(is_tmp=True)
-        tmp_dir.touch()
+        outputs = self.output()
 
-        # create a scratch directory for temporary downloads that will not be bundled
-        scratch_dir = tmp_dir.child("scratch", type="d")
-        scratch_dir.touch()
+        # remove the bundle if recreating
+        if self.recreate and outputs["bundle"].exists():
+            outputs["bundle"].remove()
 
-        # progress callback
-        progress = self.create_progress_callback(len(law.util.flatten(self.ext_files)))
+        # bundle only if needed
+        if not outputs["bundle"].exists():
+            if not env_is_local:
+                raise RuntimeError(
+                    f"the output bundle {self.single_output().abspath} is missing, but cannot be created in non-local "
+                    "environments",
+                )
 
-        # helper to fetch a single src to dst
-        def fetch(src, dst):
-            if src.startswith(("http://", "https://")):
-                # download via wget
-                wget(src, dst)
-            elif os.path.isfile(src):
-                # copy local file
-                shutil.copy2(src, dst)
-            elif os.path.isdir(src):
-                # copy local dir
-                shutil.copytree(src, dst)
-            else:
-                raise NotImplementedError(f"fetching {src} is not supported")
+            # create a tmp dir to work in
+            tmp_dir = law.LocalDirectoryTarget(is_tmp=True)
+            tmp_dir.touch()
 
-        # helper function to fetch generic files
-        def fetch_file(ext_file, counter=[0]):
-            if ext_file.subpaths:
-                # copy to scratch dir first in case a subpath is requested
-                basename = self.create_unique_basename(ext_file.location)
-                scratch_dst = os.path.join(scratch_dir.abspath, basename)
-                fetch(ext_file.location, scratch_dst)
-                # when not a directory, assume the file is an archive and unpack it
-                if not os.path.isdir(scratch_dst):
-                    arc_dir = scratch_dir.child(basename.split(".")[0] + "_unpacked", type="d")
-                    self.publish_message(f"unpacking {scratch_dst}")
-                    law.LocalFileTarget(scratch_dst).load(arc_dir)
-                    scratch_src = arc_dir.abspath
+            # create a scratch directory for temporary downloads that will not be bundled
+            scratch_dir = tmp_dir.child("scratch", type="d")
+            scratch_dir.touch()
+
+            # progress callback
+            progress = self.create_progress_callback(len(law.util.flatten(self.ext_files)))
+
+            # helper to fetch a single src to dst
+            def fetch(src, dst):
+                if src.startswith(("http://", "https://")):
+                    # download via wget
+                    wget(src, dst)
+                elif os.path.isfile(src):
+                    # copy local file
+                    shutil.copy2(src, dst)
+                elif os.path.isdir(src):
+                    # copy local dir
+                    shutil.copytree(src, dst)
                 else:
-                    scratch_src = scratch_dst
-                # copy all subpaths
-                basenames = self.create_unique_basename(ext_file)
-                for name, subpath in ext_file.subpaths.items():
-                    fetch(os.path.join(scratch_src, subpath), os.path.join(tmp_dir.abspath, basenames[name]))
-            else:
-                # copy directly to the bundle dir
-                src = ext_file.location
-                dst = os.path.join(tmp_dir.abspath, self.create_unique_basename(ext_file.location))
-                fetch(src, dst)
-            # log
-            self.publish_message(f"fetched {ext_file}")
-            progress(counter[0])
-            counter[0] += 1
+                    err = f"cannot fetch {src}"
+                    if src.startswith("/") and os.path.isdir("/".join(src.split("/", 2)[:2])):
+                        err += ", file or directory does not exist"
+                    else:
+                        err += ", resource type is not supported"
+                    raise NotImplementedError(err)
 
-        # fetch all files and cleanup scratch dir
-        law.util.map_struct(fetch_file, self.ext_files)
-        scratch_dir.remove()
+            # helper function to fetch generic files
+            def fetch_file(ext_file, counter=[0]):
+                if ext_file.subpaths:
+                    # copy to scratch dir first in case a subpath is requested
+                    basename = self.create_unique_basename(ext_file.location)
+                    scratch_dst = os.path.join(scratch_dir.abspath, basename)
+                    fetch(ext_file.location, scratch_dst)
+                    # when not a directory, assume the file is an archive and unpack it
+                    if not os.path.isdir(scratch_dst):
+                        arc_dir = scratch_dir.child(basename.split(".")[0] + "_unpacked", type="d")
+                        self.publish_message(f"unpacking {scratch_dst}")
+                        law.LocalFileTarget(scratch_dst).load(arc_dir)
+                        scratch_src = arc_dir.abspath
+                    else:
+                        scratch_src = scratch_dst
+                    # copy all subpaths
+                    if ext_file.single:
+                        fetch(
+                            os.path.join(scratch_src, ext_file.subpaths[ext_file.single_key]),
+                            os.path.join(tmp_dir.abspath, self.create_unique_basename(ext_file)),
+                        )
+                    else:
+                        basenames = self.create_unique_basename(ext_file)
+                        for name, subpath in ext_file.subpaths.items():
+                            fetch(os.path.join(scratch_src, subpath), os.path.join(tmp_dir.abspath, basenames[name]))
+                else:
+                    # copy directly to the bundle dir
+                    src = ext_file.location
+                    dst = os.path.join(tmp_dir.abspath, self.create_unique_basename(ext_file.location))
+                    fetch(src, dst)
+                # log
+                self.publish_message(f"fetched {ext_file}")
+                progress(counter[0])
+                counter[0] += 1
 
-        # create the bundle
-        tmp = law.LocalFileTarget(is_tmp="tgz")
-        tmp.dump(tmp_dir, formatter="tar")
+            # fetch all files and cleanup scratch dir
+            law.util.map_struct(fetch_file, self.ext_files)
+            scratch_dir.remove()
 
-        # log the file size
-        bundle_size = law.util.human_bytes(tmp.stat().st_size, fmt=True)
-        self.publish_message(f"bundle size is {bundle_size}")
+            # create the bundle
+            tmp = law.LocalFileTarget(is_tmp="tgz")
+            tmp.dump(tmp_dir, formatter="tar")
 
-        # transfer the result
-        self.transfer(tmp)
+            # log the file size
+            bundle_size = law.util.human_bytes(tmp.stat().st_size, fmt=True)
+            self.publish_message(f"bundle size is {bundle_size}")
+
+            # transfer the result
+            self.transfer(tmp, outputs["bundle"])
+
+        # remove all local files if recreating or if only existing partially to do a full refresh
+        local_files_exist = outputs["local_files"].exists()
+        if (self.recreate and local_files_exist) or not local_files_exist:
+            outputs["local_files"].dir.remove()
+            local_files_exist = False
+
+        # unpack the bundle to have local files available if needed
+        if not local_files_exist:
+            with self.publish_step(f"unpacking to {outputs['local_files'].dir.abspath} ..."):
+                bundle = outputs["bundle"]
+                if isinstance(bundle, law.FileCollection):
+                    bundle = bundle.random_target()
+                bundle.load(outputs["local_files"].dir, formatter="tar")
+
+                # check if unpacked files/directories are described by the correct target class
+                for target in outputs["local_files"]._flat_target_list:
+                    mismatch = (
+                        (isinstance(target, law.FileSystemFileTarget) and not os.path.isfile(target.abspath)) or
+                        (isinstance(target, law.FileSystemDirectoryTarget) and not os.path.isdir(target.abspath))
+                    )
+                    if mismatch:
+                        raise Exception(f"mismatching file/directory type of unpacked target {target!r}")
+
+
+BundleExternalFilesWrapper = wrapper_factory(
+    base_cls=AnalysisTask,
+    require_cls=BundleExternalFiles,
+    enable=["configs", "skip_configs"],
+    attributes={"version": None},
+    docs="""
+Wrapper task trigger the BundleExternalFiles task for multiple configs.
+""",
+)
