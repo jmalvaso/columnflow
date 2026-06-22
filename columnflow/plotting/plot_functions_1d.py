@@ -38,6 +38,22 @@ if TYPE_CHECKING:
     hist = maybe_import("hist")
     plt = maybe_import("matplotlib.pyplot")
 
+def scale_selected_processes(hists: OrderedDict, scales: dict[str, float]) -> OrderedDict:
+    """
+    Scale selected process histograms by process name.
+
+    For Weight() histograms, multiplying the Hist object by a scalar is the
+    correct operation for plotting: all bins and all shift variations are scaled.
+    """
+    scaled_hists = hists.copy()
+
+    for proc_inst, hist_inst in list(scaled_hists.items()):
+        proc_name = getattr(proc_inst, "name", None)
+
+        if proc_name in scales:
+            scaled_hists[proc_inst] = hist_inst * scales[proc_name]
+
+    return scaled_hists
 
 def plot_variable_stack(
     hists: OrderedDict,
@@ -57,12 +73,23 @@ def plot_variable_stack(
 
     # process-based settings (styles and attributes)
     hists, process_style_config = apply_process_settings(hists, process_settings)
+
     # variable-based settings (rebinning, slicing, flow handling)
     hists, variable_style_config = apply_variable_settings(hists, variable_insts, variable_settings)
+
     # remove data in bins where sensitivity exceeds some threshold
     blinding_threshold = kwargs.get("blinding_threshold", None)
     if blinding_threshold:
         hists = blind_sensitive_bins(hists, config_inst, blinding_threshold)
+
+    # scale selected processes
+    hists = scale_selected_processes(
+        hists,
+        {
+            "dy_tt_m50": 1.0,
+            "tt": 1.0,
+        },
+    )
 
     # remove negative contributions per process if requested
     if kwargs.get("remove_negative", None):
@@ -70,6 +97,7 @@ def plot_variable_stack(
 
     # process scaling
     hists = apply_process_scaling(hists)
+
     # density scaling per bin
     if density:
         hists = apply_density(hists, density)
@@ -104,9 +132,11 @@ def plot_variable_stack(
         shape_norm,
         yscale,
     )
+
     # additional, plot function specific changes
     if shape_norm:
         default_style_config["ax_cfg"]["ylabel"] = "Normalized entries"
+
     style_config = law.util.merge_dicts(
         default_style_config,
         process_style_config,
@@ -116,7 +146,6 @@ def plot_variable_stack(
     )
 
     return plot_all(plot_config, style_config, **kwargs)
-
 
 def plot_variable_efficiency(
     hists: OrderedDict,
@@ -280,8 +309,7 @@ def plot_shifted_variable(
 
         h = h_sum[{"shift": hist.loc(shift_name)}]
         # assuming `nominal` always has shift id 0
-        ratio_norm = h_sum[{"shift": hist.loc("nominal")}].values()
-
+        ratio_norm = h_sum[{"shift": hist.loc("nominal")}].values() 
         diff = sum(h.values()) / sum(ratio_norm) - 1
         label = shift_inst.label
         if not shift_inst.is_nominal:

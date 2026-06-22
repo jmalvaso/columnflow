@@ -351,7 +351,7 @@ def jec(
     events = set_ak_column_f32(events, f"{jet_name}.pt_raw", events[jet_name].pt * (1 - events[jet_name].rawFactor))
     events = set_ak_column_f32(events, f"{jet_name}.mass_raw", events[jet_name].mass * (1 - events[jet_name].rawFactor))
 
-    def correct_jets(*, pt, eta, phi, area, rho, run, evaluator_key="jec"):
+    def correct_jets(*, pt, eta, phi, area, rho, evaluator_key="jec"):
         # variable naming convention
         variable_map = {
             "JetA": area,
