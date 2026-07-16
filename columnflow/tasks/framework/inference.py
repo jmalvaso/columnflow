@@ -106,6 +106,26 @@ class SerializeInferenceModelBase(
                 law.util.multi_match(dataset.name, config_data.data_datasets, mode=any)
             )
         ]
+    @classmethod
+    def get_hist_requirement_variables(self, variables: set[str]) -> set[str]:
+        """
+        Expand the variables requested from MergeShiftedHistograms.
+
+        By default, keep the exact variables used by the inference model.
+        Analysis-specific inference models can implement
+        ``get_hist_requirement_variables`` to request additional variables,
+        so that several datacard models share the same upstream histogram task.
+        """
+        expander = getattr(
+            self.inference_model_inst,
+            "get_hist_requirement_variables",
+            None,
+        )
+
+        if callable(expander):
+            return set(expander(set(variables)))
+
+        return set(variables)
 
     @law.workflow_property(cache=True)
     def combined_config_data(self) -> dict[od.ConfigInst, dict[str, dict | set]]:
@@ -201,15 +221,20 @@ class SerializeInferenceModelBase(
         # gather data from inference model to define requirements in the structure
         # config_name -> dataset_name -> MergeHistogramsTask
         reqs = {}
+
         for config_inst, data in self.combined_config_data.items():
             reqs[config_inst.name] = {}
+
+            hist_variables = self.get_hist_requirement_variables(data["variables"])
+            hist_variables = tuple(sorted(hist_variables))
+
             # mc datasets
             for dataset_name in sorted(data["mc_datasets"]):
                 reqs[config_inst.name][dataset_name] = self._hist_requirement(
                     config=config_inst.name,
                     dataset=dataset_name,
                     shift_sources=("nominal",) + tuple(sorted(data["mc_datasets"][dataset_name]["shift_sources"])),
-                    variables=tuple(sorted(data["variables"])),
+                    variables=hist_variables,
                     **kwargs,
                 )
 
@@ -219,7 +244,7 @@ class SerializeInferenceModelBase(
                     config=config_inst.name,
                     dataset=dataset_name,
                     shift_sources=("nominal",),
-                    variables=tuple(sorted(data["variables"])),
+                    variables=hist_variables,
                     **kwargs,
                 )
 

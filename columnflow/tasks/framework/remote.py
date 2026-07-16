@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import re
 import math
+import shutil
+import time
 from dataclasses import dataclass
 
 import luigi
@@ -814,6 +816,90 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         # and allow rendering inside the job
         return law.JobInputFile(bootstrap_file, share=True, render_job=True)
 
+    def htcondor_userlog_base_directory(self) -> str:
+        """
+        Base directory for HTCondor event logs.
+        """
+        return os.environ.get(
+            "CF_HTCONDOR_USERLOG_DIR",
+            os.path.join(os.path.expanduser("~"), "htcondor_userlogs_columnflow"),
+        )
+
+    def htcondor_userlog_directory(self) -> str:
+        htcondor_userlog_base = self.htcondor_userlog_base_directory()
+
+        date_tag = os.environ.get("CF_HTCONDOR_USERLOG_DATE", time.strftime("%Y%m%d"))
+
+        run_tag = os.environ.get("CF_HTCONDOR_USERLOG_RUN_ID", "default")
+        run_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_tag)
+
+        safe_task_family = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.task_family)
+        task_hash = law.util.create_hash(self.task_id)[:10]
+
+        return os.path.join(
+            htcondor_userlog_base,
+            date_tag,
+            run_tag,
+            safe_task_family,
+            task_hash,
+        )
+
+    def cleanup_successful_htcondor_userlogs(self) -> None:
+        """
+        Remove HTCondor event logs only after LAW observed a successful workflow.
+
+        Failed workflows keep their logs for debugging. This method is only called
+        from ``htcondor_post_poll_callback`` when ``success`` is true.
+        """
+        cleanup = os.environ.get("CF_HTCONDOR_CLEAN_SUCCESS_LOGS", "1").lower()
+        if cleanup in {"0", "false", "no", "off"}:
+            return
+
+        log_dir = self.htcondor_userlog_directory()
+        base_dir = self.htcondor_userlog_base_directory()
+
+        log_dir_abs = os.path.abspath(os.path.expanduser(log_dir))
+        base_dir_abs = os.path.abspath(os.path.expanduser(base_dir))
+
+        # Safety guards: never remove the base directory itself, and never remove
+        # anything outside of it.
+        if log_dir_abs == base_dir_abs:
+            self.logger.warning(
+                "refusing to remove HTCondor userlog base directory: %s",
+                log_dir_abs,
+            )
+            return
+
+        if not log_dir_abs.startswith(base_dir_abs + os.sep):
+            self.logger.warning(
+                "refusing to remove HTCondor userlog directory outside base: %s",
+                log_dir_abs,
+            )
+            return
+
+        if not os.path.isdir(log_dir_abs):
+            return
+
+        try:
+            shutil.rmtree(log_dir_abs)
+            self.logger.info("removed successful HTCondor userlog directory: %s", log_dir_abs)
+        except Exception as exc:
+            self.logger.warning(
+                "failed to remove successful HTCondor userlog directory %s: %s",
+                log_dir_abs,
+                exc,
+            )
+            return
+
+        # Remove empty parent directories up to, but not including, the base.
+        parent = os.path.dirname(log_dir_abs)
+        while parent.startswith(base_dir_abs + os.sep):
+            try:
+                os.rmdir(parent)
+            except OSError:
+                break
+            parent = os.path.dirname(parent)
+
     def htcondor_job_config(self, config, job_num, branches):
         # add common config settings
         workflow_reqs = self.htcondor_workflow_requires()
@@ -829,8 +915,17 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         # add variables related to software bundles
         self.add_bundle_render_variables(config, workflow_reqs)
 
-        # some htcondor setups require a "log" config, but we can safely use /dev/null by default
-        config.log = "log.txt" if self.htcondor_logs else "/dev/null"
+        # HTCondor job event log.
+        #
+        # Keep this log because LAW's history fallback can be redirected to
+        # ``condor_history -userlog``. Avoid writing all logs into one flat AFS
+        # directory because AFS directories have a maximum number of entries.
+        htcondor_userlog_dir = self.htcondor_userlog_directory()
+        os.makedirs(htcondor_userlog_dir, exist_ok=True)
+
+        # One event log per HTCondor cluster/submission, not per process.
+        # HTCondor expands $(Cluster) at submission time.
+        config.log = os.path.join(htcondor_userlog_dir, "$(Cluster).log")
 
         # default lcg setup file
         remote_lcg_setup = law.config.get_expanded("job", "remote_lcg_setup_el9")
@@ -925,6 +1020,11 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         summary_kwargs.setdefault("use_uniplot", self.show_memory_summary_hist)
 
         log_job_memory_summary(self.workflow_proxy.job_data, log=self.logger.info, **summary_kwargs)
+
+        # Remove HTCondor event logs only after the workflow was observed as
+        # successful by LAW. Failed workflows keep their logs for debugging.
+        if success:
+            self.cleanup_successful_htcondor_userlogs()
 
 
 _default_slurm_flavor = law.config.get_expanded("analysis", "slurm_flavor", "maxwell")
