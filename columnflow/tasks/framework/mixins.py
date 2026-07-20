@@ -25,9 +25,11 @@ from columnflow.histogramming import HistProducer
 from columnflow.ml import MLModel
 from columnflow.inference import InferenceModel
 from columnflow.columnar_util import Route, ColumnCollection, ChunkedIOHandler, TaskArrayFunction
+from columnflow.config_util import expand_shift_sources
 from columnflow.util import maybe_import, DotDict, get_docs_url, get_code_url
 from columnflow.types import Callable
 
+np = maybe_import("numpy")
 ak = maybe_import("awkward")
 
 
@@ -91,6 +93,26 @@ class CalibratorClassMixin(ArrayFunctionClassMixin):
         kwargs["_prefer_cli"] = law.util.make_set(kwargs.get("_prefer_cli", [])) | {"calibrator"}
         return super().req_params(inst, **kwargs)
 
+    @classmethod
+    def get_config_lookup_keys(
+        cls,
+        inst_or_params: CalibratorClassMixin | dict[str, Any],
+        significant: bool = False,
+    ) -> law.util.InsertiableDict:
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
+
+        # add the calibrator name
+        calibrator = (
+            inst_or_params.get("calibrator")
+            if isinstance(inst_or_params, dict)
+            else getattr(inst_or_params, "calibrator", None)
+        )
+        if calibrator not in (law.NO_STR, None, ""):
+            prefix = "calib"
+            keys[prefix] = f"{prefix}_{calibrator}"
+
+        return keys
+
     @property
     def calibrator_repr(self) -> str:
         """
@@ -105,25 +127,6 @@ class CalibratorClassMixin(ArrayFunctionClassMixin):
         parts = super().store_parts()
         parts.insert_after(self.config_store_anchor, "calibrator", f"calib__{self.calibrator_repr}")
         return parts
-
-    @classmethod
-    def get_config_lookup_keys(
-        cls,
-        inst_or_params: CalibratorClassMixin | dict[str, Any],
-    ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
-
-        # add the calibrator name
-        calibrator = (
-            inst_or_params.get("calibrator")
-            if isinstance(inst_or_params, dict)
-            else getattr(inst_or_params, "calibrator", None)
-        )
-        if calibrator not in (law.NO_STR, None, ""):
-            prefix = "calib"
-            keys[prefix] = f"{prefix}_{calibrator}"
-
-        return keys
 
 
 class CalibratorMixin(ArrayFunctionInstanceMixin, CalibratorClassMixin):
@@ -197,6 +200,23 @@ class CalibratorMixin(ArrayFunctionInstanceMixin, CalibratorClassMixin):
         (shifts.local if cls.invokes_calibrator else shifts.upstream).update(calibrator_shifts)
 
         super().get_known_shifts(params, shifts)
+
+    @classmethod
+    def req_other_calibrator(cls, inst: CalibratorMixin, **kwargs) -> CalibratorMixin:
+        """
+        Same as :py:meth:`req` but overwrites specific arguments for instantiation that simplify requesting a different
+        calibrator instance.
+
+        :param inst: The reference instance to request parameters from.
+        :param kwargs: Additional arguments forwarded to :py:meth:`req`.
+        :return: A new instance of *this* class.
+        """
+        # calibrator_inst and known_shifts must be set to None to by-pass calibrator instance cache lookup and thus,
+        # also full parameter resolution
+        kwargs.setdefault("calibrator_inst", None)
+        kwargs.setdefault("known_shifts", None)
+
+        return cls.req(inst, **kwargs)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -295,8 +315,9 @@ class CalibratorClassesMixin(ArrayFunctionClassMixin):
     def get_config_lookup_keys(
         cls,
         inst_or_params: CalibratorClassesMixin | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the calibrator names
         calibrators = (
@@ -477,6 +498,26 @@ class SelectorClassMixin(ArrayFunctionClassMixin):
         }
         return super().req_params(inst, **kwargs)
 
+    @classmethod
+    def get_config_lookup_keys(
+        cls,
+        inst_or_params: SelectorClassMixin | dict[str, Any],
+        significant: bool = False,
+    ) -> law.util.InsertiableDict:
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
+
+        # add the selector name
+        selector = (
+            inst_or_params.get("selector")
+            if isinstance(inst_or_params, dict)
+            else getattr(inst_or_params, "selector", None)
+        )
+        if selector not in (law.NO_STR, None, ""):
+            prefix = "sel"
+            keys[prefix] = f"{prefix}_{selector}"
+
+        return keys
+
     @property
     def selector_repr(self) -> str:
         """
@@ -497,25 +538,6 @@ class SelectorClassMixin(ArrayFunctionClassMixin):
         parts = super().store_parts()
         parts.insert_after(self.config_store_anchor, "selector", f"sel__{self.selector_repr}")
         return parts
-
-    @classmethod
-    def get_config_lookup_keys(
-        cls,
-        inst_or_params: SelectorClassMixin | dict[str, Any],
-    ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
-
-        # add the selector name
-        selector = (
-            inst_or_params.get("selector")
-            if isinstance(inst_or_params, dict)
-            else getattr(inst_or_params, "selector", None)
-        )
-        if selector not in (law.NO_STR, None, ""):
-            prefix = "sel"
-            keys[prefix] = f"{prefix}_{selector}"
-
-        return keys
 
 
 class SelectorMixin(ArrayFunctionInstanceMixin, SelectorClassMixin):
@@ -584,6 +606,23 @@ class SelectorMixin(ArrayFunctionInstanceMixin, SelectorClassMixin):
         (shifts.local if cls.invokes_selector else shifts.upstream).update(selector_shifts)
 
         super().get_known_shifts(params, shifts)
+
+    @classmethod
+    def req_other_selector(cls, inst: SelectorMixin, **kwargs) -> SelectorMixin:
+        """
+        Same as :py:meth:`req` but overwrites specific arguments for instantiation that simplify requesting a different
+        selector instance.
+
+        :param inst: The reference instance to request parameters from.
+        :param kwargs: Additional arguments forwarded to :py:meth:`req`.
+        :return: A new instance of *this* class.
+        """
+        # selector_inst and known_shifts must be set to None to by-pass selector instance cache lookup and thus, also
+        # full parameter resolution
+        kwargs.setdefault("selector_inst", None)
+        kwargs.setdefault("known_shifts", None)
+
+        return cls.req(inst, **kwargs)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -676,6 +715,26 @@ class ReducerClassMixin(ArrayFunctionClassMixin):
         kwargs["_prefer_cli"] = law.util.make_set(kwargs.get("_prefer_cli", [])) | {"reducer"}
         return super().req_params(inst, **kwargs)
 
+    @classmethod
+    def get_config_lookup_keys(
+        cls,
+        inst_or_params: ReducerClassMixin | dict[str, Any],
+        significant: bool = False,
+    ) -> law.util.InsertiableDict:
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
+
+        # add the reducer name
+        reducer = (
+            inst_or_params.get("reducer")
+            if isinstance(inst_or_params, dict)
+            else getattr(inst_or_params, "reducer", None)
+        )
+        if reducer not in (law.NO_STR, None, ""):
+            prefix = "red"
+            keys[prefix] = f"{prefix}_{reducer}"
+
+        return keys
+
     @property
     def reducer_repr(self) -> str:
         """
@@ -690,25 +749,6 @@ class ReducerClassMixin(ArrayFunctionClassMixin):
         parts = super().store_parts()
         parts.insert_after(self.config_store_anchor, "reducer", f"red__{self.reducer_repr}")
         return parts
-
-    @classmethod
-    def get_config_lookup_keys(
-        cls,
-        inst_or_params: ReducerClassMixin | dict[str, Any],
-    ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
-
-        # add the reducer name
-        reducer = (
-            inst_or_params.get("reducer")
-            if isinstance(inst_or_params, dict)
-            else getattr(inst_or_params, "reducer", None)
-        )
-        if reducer not in (law.NO_STR, None, ""):
-            prefix = "red"
-            keys[prefix] = f"{prefix}_{reducer}"
-
-        return keys
 
 
 class ReducerMixin(ArrayFunctionInstanceMixin, ReducerClassMixin):
@@ -731,7 +771,13 @@ class ReducerMixin(ArrayFunctionInstanceMixin, ReducerClassMixin):
 
     @classmethod
     def get_reducer_dict(cls, params: dict[str, Any]) -> dict[str, Any]:
-        return cls.get_array_function_dict(params)
+        d = cls.get_array_function_dict(params)
+
+        # special case: add selector shifts
+        if (selector_inst := params.get("selector_inst")):
+            d["selector_shifts"] = selector_inst.all_shifts
+
+        return d
 
     @classmethod
     def build_reducer_inst(
@@ -782,6 +828,23 @@ class ReducerMixin(ArrayFunctionInstanceMixin, ReducerClassMixin):
         (shifts.local if cls.invokes_reducer else shifts.upstream).update(reducer_shifts)
 
         super().get_known_shifts(params, shifts)
+
+    @classmethod
+    def req_other_reducer(cls, inst: ReducerMixin, **kwargs) -> ReducerMixin:
+        """
+        Same as :py:meth:`req` but overwrites specific arguments for instantiation that simplify requesting a different
+        reducer instance.
+
+        :param inst: The reference instance to request parameters from.
+        :param kwargs: Additional arguments forwarded to :py:meth:`req`.
+        :return: A new instance of *this* class.
+        """
+        # reducer_inst and known_shifts must be set to None to by-pass reducer instance cache lookup and thus, also full
+        # parameter resolution
+        kwargs.setdefault("reducer_inst", None)
+        kwargs.setdefault("known_shifts", None)
+
+        return cls.req(inst, **kwargs)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -852,6 +915,26 @@ class ProducerClassMixin(ArrayFunctionClassMixin):
         kwargs["_prefer_cli"] = law.util.make_set(kwargs.get("_prefer_cli", [])) | {"producer"}
         return super().req_params(inst, **kwargs)
 
+    @classmethod
+    def get_config_lookup_keys(
+        cls,
+        inst_or_params: ProducerClassMixin | dict[str, Any],
+        significant: bool = False,
+    ) -> law.util.InsertiableDict:
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
+
+        # add the producer name
+        producer = (
+            inst_or_params.get("producer")
+            if isinstance(inst_or_params, dict)
+            else getattr(inst_or_params, "producer", None)
+        )
+        if producer not in (law.NO_STR, None, ""):
+            prefix = "prod"
+            keys[prefix] = f"{prefix}_{producer}"
+
+        return keys
+
     @property
     def producer_repr(self) -> str:
         """
@@ -866,25 +949,6 @@ class ProducerClassMixin(ArrayFunctionClassMixin):
         parts = super().store_parts()
         parts.insert_after(self.config_store_anchor, "producer", f"prod__{self.producer_repr}")
         return parts
-
-    @classmethod
-    def get_config_lookup_keys(
-        cls,
-        inst_or_params: ProducerClassMixin | dict[str, Any],
-    ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
-
-        # add the producer name
-        producer = (
-            inst_or_params.get("producer")
-            if isinstance(inst_or_params, dict)
-            else getattr(inst_or_params, "producer", None)
-        )
-        if producer not in (law.NO_STR, None, ""):
-            prefix = "prod"
-            keys[prefix] = f"{prefix}_{producer}"
-
-        return keys
 
 
 class ProducerMixin(ArrayFunctionInstanceMixin, ProducerClassMixin):
@@ -958,6 +1022,23 @@ class ProducerMixin(ArrayFunctionInstanceMixin, ProducerClassMixin):
         (shifts.local if cls.invokes_producer else shifts.upstream).update(producer_shifts)
 
         super().get_known_shifts(params, shifts)
+
+    @classmethod
+    def req_other_producer(cls, inst: ProducerMixin, **kwargs) -> ProducerMixin:
+        """
+        Same as :py:meth:`req` but overwrites specific arguments for instantiation that simplify requesting a different
+        producer instance.
+
+        :param inst: The reference instance to request parameters from.
+        :param kwargs: Additional arguments forwarded to :py:meth:`req`.
+        :return: A new instance of *this* class.
+        """
+        # producer_inst and known_shifts must be set to None to by-pass producer instance cache lookup and thus, also
+        # full parameter resolution
+        kwargs.setdefault("producer_inst", None)
+        kwargs.setdefault("known_shifts", None)
+
+        return cls.req(inst, **kwargs)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -1056,8 +1137,9 @@ class ProducerClassesMixin(ArrayFunctionClassMixin):
     def get_config_lookup_keys(
         cls,
         inst_or_params: ProducerClassesMixin | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the producer names
         producers = (
@@ -1274,8 +1356,9 @@ class MLModelMixinBase(ConfigTask):
     def get_config_lookup_keys(
         cls,
         inst_or_params: MLModelMixinBase | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the ml model name
         ml_model = (
@@ -1619,8 +1702,9 @@ class MLModelsMixin(ConfigTask):
     def get_config_lookup_keys(
         cls,
         inst_or_params: MLModelsMixin | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the ml model names
         ml_models = (
@@ -1680,6 +1764,26 @@ class HistProducerClassMixin(ArrayFunctionClassMixin):
         kwargs["_prefer_cli"] = law.util.make_set(kwargs.get("_prefer_cli", [])) | {"hist_producer"}
         return super().req_params(inst, **kwargs)
 
+    @classmethod
+    def get_config_lookup_keys(
+        cls,
+        inst_or_params: HistProducerClassMixin | dict[str, Any],
+        significant: bool = False,
+    ) -> law.util.InsertiableDict:
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
+
+        # add the hist producer name
+        producer = (
+            inst_or_params.get("hist_producer")
+            if isinstance(inst_or_params, dict)
+            else getattr(inst_or_params, "hist_producer", None)
+        )
+        if producer not in (law.NO_STR, None, ""):
+            prefix = "hist"
+            keys[prefix] = f"{prefix}_{producer}"
+
+        return keys
+
     @property
     def hist_producer_repr(self) -> str:
         """
@@ -1694,25 +1798,6 @@ class HistProducerClassMixin(ArrayFunctionClassMixin):
         parts = super().store_parts()
         parts.insert_after(self.config_store_anchor, "hist_producer", f"hist__{self.hist_producer_repr}")
         return parts
-
-    @classmethod
-    def get_config_lookup_keys(
-        cls,
-        inst_or_params: HistProducerClassMixin | dict[str, Any],
-    ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
-
-        # add the hist producer name
-        producer = (
-            inst_or_params.get("hist_producer")
-            if isinstance(inst_or_params, dict)
-            else getattr(inst_or_params, "hist_producer", None)
-        )
-        if producer not in (law.NO_STR, None, ""):
-            prefix = "hist"
-            keys[prefix] = f"{prefix}_{producer}"
-
-        return keys
 
 
 class HistProducerMixin(ArrayFunctionInstanceMixin, HistProducerClassMixin):
@@ -1789,6 +1874,23 @@ class HistProducerMixin(ArrayFunctionInstanceMixin, HistProducerClassMixin):
         (shifts.local if cls.invokes_hist_producer else shifts.upstream).update(hist_producer_shifts)
 
         super().get_known_shifts(params, shifts)
+
+    @classmethod
+    def req_other_hist_producer(cls, inst: HistProducerMixin, **kwargs) -> HistProducerMixin:
+        """
+        Same as :py:meth:`req` but overwrites specific arguments for instantiation that simplify requesting a different
+        hist producer instance.
+
+        :param inst: The reference instance to request parameters from.
+        :param kwargs: Additional arguments forwarded to :py:meth:`req`.
+        :return: A new instance of *this* class.
+        """
+        # hist_producer_inst and known_shifts must be set to None to by-pass hist producer instance cache lookup and
+        # thus, also full parameter resolution
+        kwargs.setdefault("hist_producer_inst", None)
+        kwargs.setdefault("known_shifts", None)
+
+        return cls.req(inst, **kwargs)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -1949,6 +2051,7 @@ class CategoriesMixin(ConfigTask):
 
     default_categories = None
     allow_empty_categories = False
+    sort_categories = True
 
     @classmethod
     def resolve_param_values_post_init(cls, params: dict[str, Any]) -> dict[str, Any]:
@@ -1986,15 +2089,26 @@ class CategoriesMixin(ConfigTask):
             if not categories and not cls.allow_empty_categories:
                 raise ValueError(f"no categories found matching {params['categories']}")
 
+            # sort them
+            if cls.sort_categories:
+                categories = sorted(categories)
+
             params["categories"] = tuple(categories)
 
         return params
 
+    @classmethod
+    def _categories_repr(cls, categories: Sequence[str]) -> str:
+        # single category representation
+        if len(categories) == 1:
+            return cls.build_repr(categories[0])
+
+        # full representation
+        return cls.build_repr(categories, prepend_count=True)
+
     @property
     def categories_repr(self) -> str:
-        if len(self.categories) == 1:
-            return self.build_repr(self.categories[0])
-        return self.build_repr(self.categories, prepend_count=True)
+        return self._categories_repr(self.categories)
 
 
 class VariablesMixin(ConfigTask):
@@ -2081,6 +2195,15 @@ class VariablesMixin(ConfigTask):
         """
         return "-".join(map(str, variables))
 
+    @classmethod
+    def _variables_repr(cls, variables: Sequence[str]) -> str:
+        # simplified representation for single source
+        if len(variables) == 1:
+            return cls.build_repr(variables[0])
+
+        # full representation
+        return cls.build_repr(sorted(variables), prepend_count=True)
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
@@ -2092,9 +2215,7 @@ class VariablesMixin(ConfigTask):
 
     @property
     def variables_repr(self) -> str:
-        if len(self.variables) == 1:
-            return self.build_repr(self.variables[0])
-        return self.build_repr(sorted(self.variables), prepend_count=True)
+        return self._variables_repr(self.variables)
 
 
 class DatasetsProcessesMixin(ConfigTask):
@@ -2154,8 +2275,8 @@ class DatasetsProcessesMixin(ConfigTask):
 
         # helper to resolve processes and datasets for one config
         def resolve(config_inst: od.Config, processes: Any, datasets: Any) -> tuple[list[str], list[str]]:
+            processes_orig = processes
             if processes != law.no_value:
-                processes_orig = processes
                 if processes:
                     processes = cls.find_config_objects(
                         names=processes,
@@ -2194,6 +2315,13 @@ class DatasetsProcessesMixin(ConfigTask):
                         object_cls=od.Dataset,
                         groups_str="dataset_groups",
                     )
+                    # reduce processes to those present in selected datasets when none were given initially
+                    if datasets and processes and processes_orig in {law.no_value, ()}:
+                        dataset_insts = list(map(config_inst.get_dataset, datasets))
+                        processes = tuple(
+                            process for process in processes
+                            if any(dataset_inst.has_process(process) for dataset_inst in dataset_insts)
+                        )
                 elif processes and processes != law.no_value:
                     # pick all datasets that contain any of the requested (sub)processes
                     sub_process_insts = sum((
@@ -2306,12 +2434,30 @@ class ShiftSourcesMixin(ConfigTask):
     shift_sources = law.CSVParameter(
         default=(),
         description="comma-separated shift source names (without direction) or patterns to select; can also be the key "
-        "of a mapping defined in the 'shift_group' auxiliary data of the config; default: ()",
+        "of a mapping defined in the 'shift_group' auxiliary data of the config; empty default",
         brace_expand=True,
         parse_empty=True,
     )
 
     allow_empty_shift_sources = False
+    sort_shift_sources = True
+    enforce_nominal_shift_source = False
+    remove_nominal_shift_source = False
+
+    @classmethod
+    def modify_param_values(cls, params: dict[str, Any]) -> dict[str, Any]:
+        params = super().modify_param_values(params)
+
+        # enforce/remove nominal shift source
+        if params.get("shift_sources") is not None:
+            if cls.enforce_nominal_shift_source and "nominal" not in params["shift_sources"]:
+                params["shift_sources"] = ("nominal",) + tuple(params["shift_sources"])
+            elif cls.remove_nominal_shift_source and "nominal" in params["shift_sources"]:
+                params["shift_sources"] = tuple(
+                    source for source in params["shift_sources"] if source != "nominal"
+                )
+
+        return params
 
     @classmethod
     def resolve_param_values_post_init(cls, params: dict[str, Any]) -> dict[str, Any]:
@@ -2320,7 +2466,7 @@ class ShiftSourcesMixin(ConfigTask):
         # resolve shift sources
         if (container := cls._get_config_container(params)) and "shift_sources" in params:
             shifts = cls.find_config_objects(
-                names=cls.expand_shift_sources(params["shift_sources"]),
+                names=expand_shift_sources(params["shift_sources"]),
                 container=container,
                 object_cls=od.Shift,
                 groups_str="shift_groups",
@@ -2332,12 +2478,12 @@ class ShiftSourcesMixin(ConfigTask):
             if shifts:
                 sources = cls.reduce_shifts(shifts)
 
-                # # reduce shifts based on known shifts
+                # reduce shifts based on known shifts
                 if "known_shifts" not in params:
                     raise ValueError("known_shifts must be set before resolving shift sources")
                 sources = [
                     source for source in sources
-                    if (
+                    if source == "nominal" or (
                         f"{source}_up" in params["known_shifts"].upstream and
                         f"{source}_down" in params["known_shifts"].upstream
                     )
@@ -2347,14 +2493,14 @@ class ShiftSourcesMixin(ConfigTask):
             if not sources and not cls.allow_empty_shift_sources:
                 raise ValueError(f"no shifts found matching {params['shift_sources']}")
 
+            # potentially sort them
+            if cls.sort_shift_sources:
+                sources = sorted(sources)
+
             # store them
             params["shift_sources"] = tuple(sources)
 
         return params
-
-    @classmethod
-    def expand_shift_sources(cls, sources: Sequence[str] | set[str]) -> list[str]:
-        return sum(([f"{s}_up", f"{s}_down"] for s in sources), [])
 
     @classmethod
     def reduce_shifts(cls, shifts: Sequence[str] | set[str]) -> list[str]:
@@ -2363,15 +2509,41 @@ class ShiftSourcesMixin(ConfigTask):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        self.shifts = self.expand_shift_sources(self.shift_sources)
+        self.shifts = expand_shift_sources(self.shift_sources)
+
+    @classmethod
+    def _shift_sources_repr(
+        cls,
+        shift_sources: tuple[str, ...] | None,
+        enforce_nominal_shift_source: bool = False,
+    ) -> str:
+        if not shift_sources:
+            return "none"
+
+        # when nominal is the only source, but it is enforced to be present, also show "none" as in "no additional" ones
+        if enforce_nominal_shift_source and tuple(shift_sources) == ("nominal",):
+            return "none"
+
+        # sort shift sources, moving nominal to front if present, but dropping it if enforced
+        sorted_sources = sorted(shift_sources)
+        if "nominal" in sorted_sources:
+            sorted_sources.remove("nominal")
+            if not enforce_nominal_shift_source:
+                sorted_sources.insert(0, "nominal")
+
+        # simplified representation for single source
+        if len(sorted_sources) == 1:
+            return cls.build_repr(sorted_sources[0])
+
+        # full representation
+        return cls.build_repr(sorted_sources, prepend_count=True)
 
     @property
     def shift_sources_repr(self) -> str:
-        if not self.shift_sources:
-            return "none"
-        if len(self.shift_sources) == 1:
-            return self.build_repr(self.shift_sources[0])
-        return self.build_repr(sorted(self.shift_sources), prepend_count=True)
+        return self._shift_sources_repr(
+            self.shift_sources,
+            enforce_nominal_shift_source=self.enforce_nominal_shift_source,
+        )
 
     def store_parts(self) -> law.util.InsertableDict:
         parts = super().store_parts()
@@ -2386,7 +2558,7 @@ class DatasetShiftSourcesMixin(ShiftSourcesMixin, DatasetTask):
     effective_shift = None
     allow_empty_shift = True
 
-    # allow empty sources, i.e., using only nominal
+    # allow empty sources
     allow_empty_shift_sources = True
 
 
@@ -2416,18 +2588,25 @@ class ChunkedIOMixin(ConfigTask):
     @classmethod
     def raise_if_not_finite(cls, ak_array: ak.Array) -> None:
         """
-        Checks whether all values in array *ak_array* are finite.
+        Checks whether values of all columns in *ak_array* are finite. String and bytestring types are skipped.
 
         The check is performed using the :external+numpy:py:func:`numpy.isfinite` function.
 
-        :param ak_array: Array with events to check.
+        :param ak_array: Array with columns to check.
         :raises ValueError: If any value in *ak_array* is not finite.
         """
-        import numpy as np
         from columnflow.columnar_util import get_ak_routes
 
         for route in get_ak_routes(ak_array):
-            if ak.any(~np.isfinite(ak.flatten(route.apply(ak_array), axis=None))):
+            # flatten
+            flat = ak.flatten(route.apply(ak_array), axis=None)
+            # perform parameter dependent checks
+            if isinstance((params := getattr(getattr(flat, "layout", None), "parameters", None)), dict):
+                # skip string and bytestring arrays
+                if params.get("__array__") in {"string", "bytestring"}:
+                    continue
+            # check finiteness
+            if ak.any(~np.isfinite(flat)):
                 raise ValueError(f"found one or more non-finite values in column '{route.column}' of array {ak_array}")
 
     @classmethod
@@ -2531,6 +2710,7 @@ class HistHookMixin(ConfigTask):
     def invoke_hist_hooks(
         self,
         hists: dict[od.Config, dict[od.Process, Any]],
+        hook_kwargs: dict | None = None,
     ) -> dict[od.Config, dict[od.Process, Any]]:
         """
         Invoke hooks to modify histograms before further processing such as plotting.
@@ -2552,7 +2732,7 @@ class HistHookMixin(ConfigTask):
 
             # invoke it
             self.publish_message(f"invoking hist hook '{hook}'")
-            hists = func(self, hists)
+            hists = func(self, hists, **(hook_kwargs or {}))
 
         return hists
 

@@ -11,16 +11,15 @@ import inspect
 import law
 import order as od
 
-from columnflow.types import Callable
+from columnflow.production import TaskArrayFunctionWithProducerRequirements
 from columnflow.util import DerivableMeta, maybe_import
-from columnflow.columnar_util import TaskArrayFunction
-from columnflow.types import Any
+from columnflow.types import TYPE_CHECKING, Any, Callable, Sequence
+
+if TYPE_CHECKING:
+    hist = maybe_import("hist")
 
 
-hist = maybe_import("hist")
-
-
-class HistProducer(TaskArrayFunction):
+class HistProducer(TaskArrayFunctionWithProducerRequirements):
     """
     Base class for all histogram producers, i.e., functions that control the creation of histograms, event weights, and
     optional post-processing.
@@ -58,6 +57,10 @@ class HistProducer(TaskArrayFunction):
     skip_compatibility_check = False
     exposed = True
 
+    # register attributes for arguments accepted by decorator
+    mc_only: bool = False
+    data_only: bool = False
+
     @classmethod
     def hist_producer(
         cls,
@@ -65,6 +68,7 @@ class HistProducer(TaskArrayFunction):
         bases: tuple = (),
         mc_only: bool = False,
         data_only: bool = False,
+        require_producers: Sequence[str] | set[str] | None = None,
         **kwargs,
     ) -> DerivableMeta | Callable:
         """
@@ -83,6 +87,7 @@ class HistProducer(TaskArrayFunction):
             skipped for real data.
         :param data_only: Boolean flag indicating that this hist producer should only run on real data and skipped for
             Monte Carlo simulation.
+        :param require_producers: Sequence of names of other producers to add to the requirements.
         :return: New hist producer subclass.
         """
         def decorator(func: Callable) -> DerivableMeta:
@@ -92,6 +97,7 @@ class HistProducer(TaskArrayFunction):
                 "call_func": func,
                 "mc_only": mc_only,
                 "data_only": data_only,
+                "require_producers": require_producers,
             }
 
             # get the module name
@@ -247,7 +253,7 @@ class HistProducer(TaskArrayFunction):
             return h
         return self.post_process_hist_func(h, task=task)
 
-    def run_post_process_merged_hist(self, h: Any, task: law.Task) -> hist.Histogram:
+    def run_post_process_merged_hist(self, h: Any, task: law.Task) -> hist.Hist:
         """
         Invokes the :py:meth:`post_process_merged_hist_func` of this instance and returns its result, forwarding all
         arguments.

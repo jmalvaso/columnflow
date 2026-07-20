@@ -203,7 +203,10 @@ setup_venv() {
         fi
 
         # create the pending_flag to express that the venv state might be changing
-        [ ! -f "${pending_flag_file}" ] && touch "${pending_flag_file}"
+        mark_pending() {
+            [ -f "${pending_flag_file}" ] && return "0"
+            touch "${pending_flag_file}"
+        }
         clear_pending() {
             rm -f "${pending_flag_file}"
         }
@@ -220,6 +223,7 @@ setup_venv() {
             if [ "${current_version}" != "${venv_version}" ]; then
                 if [ "${mode}" = "update" ]; then
                     # remove the venv in case an update is requested
+                    mark_pending || return "$?"
                     echo "removing current installation at ${install_path_repr} (mode '${mode}', installed version ${current_version}, requested version ${venv_version})"
                     rm -rf "${install_path}"
 
@@ -248,7 +252,11 @@ setup_venv() {
 
         # install if not existing
         if [ ! -f "${CF_SANDBOX_FLAG_FILE}" ]; then
-            cf_color cyan "installing venv ${CF_VENV_NAME} from ${sandbox_file} at ${install_path}"
+            mark_pending || return "$?"
+
+            echo -n "$( cf_color cyan "installing venv" )"
+            echo -n " $( cf_color cyan_bright "${CF_VENV_NAME}" )"
+            echo " $( cf_color cyan "from ${sandbox_file} at ${install_path}" )"
 
             rm -rf "${install_path}"
             cf_create_venv "${venv_name_hashed}"
@@ -326,7 +334,14 @@ setup_venv() {
                     law_wlcg_get_file "${sandbox_uris[i]}" "${sandbox_patterns[i]}" "bundle.tgz" &&
                     tar -xzf "bundle.tgz"
                 ) || return "$?"
+
                 found_sandbox="true"
+
+                # let the home variable in pyvenv.cfg point to the conda bin directory
+                sed -i -r \
+                    "s|^(home = ).+/bin/?$|\1$CF_CONDA_BASE\/bin|" \
+                    "${install_path}/pyvenv.cfg"
+
                 break
             done
             if ! ${found_sandbox}; then
@@ -334,11 +349,6 @@ setup_venv() {
                 return "31"
             fi
         fi
-
-        # let the home variable in pyvenv.cfg point to the conda bin directory
-        sed -i -r \
-            "s|^(home = ).+/bin/?$|\1$CF_CONDA_BASE\/bin|" \
-            "${install_path}/pyvenv.cfg"
 
         # activate it
         source "${install_path}/bin/activate" "" || return "$?"

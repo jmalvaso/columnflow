@@ -15,12 +15,11 @@ import yaml
 
 from columnflow.types import Generator, Callable, TextIO, Sequence, Any, Hashable, Type, T
 from columnflow.util import (
-    CachedDerivableMeta, Derivable, DotDict, is_pattern, is_regex, pattern_matcher, get_docs_url,
-    freeze,
+    CachedDerivableMeta, Derivable, DotDict, is_pattern, is_regex, pattern_matcher, get_docs_url, freeze,
 )
 
-logger = law.logger.get_logger(__name__)
 
+logger = law.logger.get_logger(__name__)
 
 default_dataset = law.config.get_expanded("analysis", "default_dataset")
 
@@ -40,16 +39,14 @@ class ParameterType(enum.Enum):
     rate_unconstrained = "rate_unconstrained"
     shape = "shape"
 
-    def __str__(self: ParameterType) -> str:
-        """
-        Returns the string representation of the parameter type.
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}.{self.value}>"
 
-        :returns: The string representation of the parameter type.
-        """
+    def __str__(self) -> str:
         return self.value
 
     @property
-    def is_rate(self: ParameterType) -> bool:
+    def is_rate(self) -> bool:
         """
         Checks if the parameter type is a rate type.
 
@@ -62,7 +59,7 @@ class ParameterType(enum.Enum):
         }
 
     @property
-    def is_shape(self: ParameterType) -> bool:
+    def is_shape(self) -> bool:
         """
         Checks if the parameter type is a shape type.
 
@@ -77,35 +74,63 @@ class ParameterTransformation(enum.Enum):
     """
     Flags denoting transformations to be applied on parameters.
 
+    Implementation details depend on the routines that apply these transformations, usually as part for a serialization
+    processes (such as so-called "datacards" in the CMS context). As such, the exact implementation may also differ
+    depending on the type of the parameter that a transformation is applied to (e.g. shape vs rate).
+
+    The general purpose of each transformation is described below.
+
     :cvar none: No transformation.
-    :cvar centralize: Centralize the parameter.
-    :cvar symmetrize: Symmetrize the parameter.
-    :cvar asymmetrize: Asymmetrize the parameter.
-    :cvar asymmetrize_if_large: Asymmetrize the parameter if it is large.
-    :cvar normalize: Normalize the parameter.
-    :cvar effect_from_shape: Derive effect from shape.
-    :cvar effect_from_rate: Derive effect from rate.
+    :cvar effect_from_rate: Creates shape variations for a shape-type parameter using the single- or two-valued effect
+        usually attributed to rate-type parameters. Only applies to shape-type parameters.
+    :cvar effect_from_shape: Derive the effect of a rate-type parameter using the overall, integral effect of shape
+        variations. Only applies to rate-type parameters.
+    :cvar effect_from_shape_if_flat: Same as :py:attr:`effect_from_shape`, but applies only if both shape variations are
+        reasonably flat. The definition of "reasonably flat" can be subject to the serialization routine. Only applies
+        to rate-type parameters.
+    :cvar symmetrize: The overall (integral) effect of up and down variations is measured and centralized, updating the
+        variations such that they are equidistant to the nominal one. Can apply to both rate- and shape-type parameters.
+    :cvar asymmetrize: The symmetric effect on a rate-type parameter (usually given as a single value) is converted into
+        an asymmetric representation (using two values). Only applies to rate-type parameters.
+    :cvar asymmetrize_if_large: Same as :py:attr:`asymmetrize`, but depending on a threshold on the size of the
+        symmetric effect which can be subject to the serialization routine. Only applies to rate-type parameters.
+    :cvar normalize: Variations of shape-type parameters are changed such that their integral effect identical to the
+        nominal one. Should only apply to shape-type parameters.
+    :cvar envelope: Builds an evelope of the up and down variations of a shape-type parameter, potentially on a
+        bin-by-bin basis. Only applies to shape-type parameters.
+    :cvar envelope_if_one_sided: Same as :py:attr:`envelope`, but only if the shape variations are one-sided following
+        a definition that can be subject to the serialization routine. Only applies to shape-type parameters.
+    :cvar envelope_enforce_two_sided: Same as :py:attr:`envelope`, but it enforces that the up (down) variation of the
+        constructed envelope is always above (below) the nominal one. Only applies to shape-type parameters.
+    :cvar flip_smaller_if_one_sided: For asymmetric rate effects (usually given by two values) that are found to be
+        one-sided (e.g. after applying :py:attr:`effect_from_shape`), flips the smaller effect to the other side of the
+        nominal value. Only applies to rate-type parameters.
+    :cvar flip_larger_if_one_sided: Same as :py:attr:`flip_smaller_if_one_sided`, but flips the larger effect. Only
+        applies to rate-type parameters.
     """
 
     none = "none"
-    centralize = "centralize"
+    effect_from_rate = "effect_from_rate"
+    effect_from_shape = "effect_from_shape"
+    effect_from_shape_if_flat = "effect_from_shape_if_flat"
     symmetrize = "symmetrize"
     asymmetrize = "asymmetrize"
     asymmetrize_if_large = "asymmetrize_if_large"
     normalize = "normalize"
-    effect_from_shape = "effect_from_shape"
-    effect_from_rate = "effect_from_rate"
+    envelope = "envelope"
+    envelope_if_one_sided = "envelope_if_one_sided"
+    envelope_enforce_two_sided = "envelope_enforce_two_sided"
+    flip_smaller_if_one_sided = "flip_smaller_if_one_sided"
+    flip_larger_if_one_sided = "flip_larger_if_one_sided"
 
-    def __str__(self: ParameterTransformation) -> str:
-        """
-        Returns the string representation of the parameter transformation.
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}.{self.value}>"
 
-        :returns: The string representation of the parameter transformation.
-        """
+    def __str__(self) -> str:
         return self.value
 
     @property
-    def from_shape(self: ParameterTransformation) -> bool:
+    def from_shape(self) -> bool:
         """
         Checks if the transformation is derived from shape.
 
@@ -113,10 +138,11 @@ class ParameterTransformation(enum.Enum):
         """
         return self in {
             self.effect_from_shape,
+            self.effect_from_shape_if_flat,
         }
 
     @property
-    def from_rate(self: ParameterTransformation) -> bool:
+    def from_rate(self) -> bool:
         """
         Checks if the transformation is derived from rate.
 
@@ -194,7 +220,9 @@ class FlowStrategy(enum.Enum):
 class InferenceModelMeta(CachedDerivableMeta):
 
     def _get_inst_cache_key(cls, args: tuple, kwargs: dict) -> Hashable:
-        return freeze((cls, kwargs.get("inst_dict", {})))
+        config_insts = args[0] if args else kwargs.get("config_insts", [])
+        config_names = tuple(sorted(config_inst.name for config_inst in config_insts))
+        return freeze((cls, config_names, kwargs.get("inst_dict", {})))
 
 
 class InferenceModel(Derivable, metaclass=InferenceModelMeta):
@@ -372,7 +400,7 @@ class InferenceModel(Derivable, metaclass=InferenceModelMeta):
         Returns a dictionary representing the top-level structure of the model.
 
             - *categories*: List of :py:meth:`category_spec` objects.
-            - *parameter_groups*: List of :py:meth:`paramter_group_spec` objects.
+            - *parameter_groups*: List of :py:meth:`parameter_group_spec` objects.
         """
         return DotDict([
             ("categories", []),
@@ -572,40 +600,11 @@ class InferenceModel(Derivable, metaclass=InferenceModelMeta):
             ("shift_source", str(shift_source) if shift_source else None),
         ])
 
-    @classmethod
-    def require_shapes_for_parameter(self, param_obj: dict) -> bool:
-        """
-        Function to check if for a certain parameter object *param_obj* varied
-        shapes are needed.
-
-        :param param_obj: The parameter object to check.
-        :returns: *True* if varied shapes are needed, *False* otherwise.
-        """
-        if param_obj.type.is_shape:
-            # the shape might be build from a rate, in which case input shapes are not required
-            if param_obj.transformations.any_from_rate:
-                return False
-            # in any other case, shapes are required
-            return True
-
-        if param_obj.type.is_rate:
-            # when the rate effect is extracted from shapes, they are required
-            if param_obj.transformations.any_from_shape:
-                return True
-            # in any other case, shapes are not required
-            return False
-
-        # other cases are not supported
-        raise Exception(
-            f"shape requirement cannot be evaluated for parameter '{param_obj.name}' with type " +
-            f"'{param_obj.type}' and transformations {param_obj.transformations}",
-        )
-
-    def __init__(self, config_insts: list[od.Config]) -> None:
+    def __init__(self, config_insts: list[od.Config] | None = None) -> None:
         super().__init__()
 
         # store attributes
-        self.config_insts = config_insts
+        self.config_insts = config_insts or []
 
         # temporary attributes for as long as we issue deprecation warnings
         self.__config_inst = None
@@ -1335,8 +1334,8 @@ class InferenceModel(Derivable, metaclass=InferenceModelMeta):
             for process in _processes:
                 process.parameters.append(_copy.deepcopy(parameter))
 
-        # add to groups
-        if group:
+        # add to groups if it was added to at least one process
+        if group and processes and any(_processes for _processes in processes.values()):
             self.add_parameter_to_group(parameter.name, group)
 
         return parameter

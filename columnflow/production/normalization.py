@@ -21,8 +21,6 @@ from columnflow.columnar_util import set_ak_column
 from columnflow.types import Any, Sequence
 
 np = maybe_import("numpy")
-sp = maybe_import("scipy")
-maybe_import("scipy.sparse")
 ak = maybe_import("awkward")
 
 
@@ -332,7 +330,7 @@ def normalization_weights(self: Producer, events: ak.Array, **kwargs) -> ak.Arra
         )
 
     # read the weight per process (defined as lumi * xsec / sum_weights) from the lookup table
-    process_weight = np.squeeze(np.asarray(self.process_weight_table[process_id, 0].todense()))
+    process_weight = np.squeeze(np.asarray(self.process_weight_table[process_id].todense()), axis=-1)
 
     # compute the weight and store it
     norm_weight = events.mc_weight * process_weight
@@ -413,6 +411,8 @@ def normalization_weights_setup(
             weights per process.
         - py: attr: `known_process_ids`: A set of all process ids that are known by the lookup table.
     """
+    import scipy.sparse
+
     # load the selection stats
     dataset_selection_stats = {
         dataset: copy.deepcopy(task.cached_value(
@@ -486,7 +486,7 @@ def normalization_weights_setup(
         )
 
     # setup the event weight lookup table
-    process_weight_table = sp.sparse.lil_matrix((max(process_ids) + 1, 1), dtype=np.float32)
+    process_weight_table = scipy.sparse.dok_matrix((max(process_ids) + 1, 1), dtype=np.float32)
 
     def fill_weight_table(process_inst: od.Process, xsec: float, sum_weights: float) -> None:
         if sum_weights == 0:
@@ -504,7 +504,13 @@ def normalization_weights_setup(
 
     # prepare info for the inclusive dataset
     inclusive_proc = self.inclusive_dataset.processes.get_first()
-    inclusive_xsec = inclusive_proc.get_xsec(self.config_inst.campaign.ecm).nominal
+    try:
+        inclusive_xsec = inclusive_proc.get_xsec(self.config_inst.campaign.ecm).nominal
+    except KeyError as e:
+        raise KeyError(
+            f"no cross section registered for inclusive process {inclusive_proc} for center-of-mass energy of "
+            f"{self.config_inst.campaign.ecm}",
+        ) from e
 
     # compute the weight the inclusive dataset would have on its own without stitching
     if self.allow_stitching and self.dataset_inst == self.inclusive_dataset:

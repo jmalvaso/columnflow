@@ -12,13 +12,14 @@ import functools
 import law
 import order as od
 
-from columnflow.columnar_util import flat_np_view
+from columnflow.columnar_util import flat_np_view, layout_ak_array
 from columnflow.util import maybe_import
-from columnflow.types import Any
+from columnflow.types import TYPE_CHECKING, Any, Sequence
 
-hist = maybe_import("hist")
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
+if TYPE_CHECKING:
+    hist = maybe_import("hist")
 
 
 logger = law.logger.get_logger(__name__)
@@ -38,6 +39,8 @@ def fill_hist(
     determined automatically and depends on the variable axis type. In this case, shifting is applied to all continuous,
     non-circular axes.
     """
+    import hist
+
     if fill_kwargs is None:
         fill_kwargs = {}
 
@@ -68,10 +71,15 @@ def fill_hist(
 
     # correct last bin values
     for ax in correct_last_bin_axes:
-        right_egde_mask = ak.flatten(data[ax.name], axis=None) == ax.edges[-1]
+        flat_values = flat_np_view(data[ax.name])
+        right_egde_mask = flat_values == ax.edges[-1]
         if np.any(right_egde_mask):
-            data[ax.name] = ak.copy(data[ax.name])
-            flat_np_view(data[ax.name])[right_egde_mask] -= ax.widths[-1] * 1e-5
+            flat_values = ak.where(right_egde_mask, flat_values - ax.widths[-1] * 1e-5, flat_values)
+            data[ax.name] = (
+                flat_values
+                if data[ax.name].ndim == 1
+                else layout_ak_array(flat_values, data[ax.name])
+            )
 
     # check if conversion to records is needed
     arr_types = (ak.Array, np.ndarray)
@@ -163,6 +171,8 @@ def get_axis_kwargs(axis: hist.axis.AxesMixin) -> dict[str, Any]:
     :param axis: The axis instance to extract information from.
     :return: The extracted information in a dict.
     """
+    import hist
+
     axis_attrs = ["name", "label"]
     traits_attrs = []
     kwargs = {}
@@ -213,6 +223,8 @@ def create_hist_from_variables(
     weight: bool = True,
     storage: str | None = None,
 ) -> hist.Hist:
+    import hist
+
     histogram = hist.Hist.new
 
     # additional category axes
@@ -259,6 +271,8 @@ def translate_hist_intcat_to_strcat(
     axis_name: str,
     id_map: dict[int, str],
 ) -> hist.Hist:
+    import hist
+
     out_axes = [
         ax if ax.name != axis_name else hist.axis.StrCategory(
             [id_map[v] for v in list(ax)],
@@ -280,6 +294,8 @@ def add_missing_shifts(
     """
     Adds missing shift bins to a histogram *h*.
     """
+    import hist
+
     # get the set of bins that are missing in the histogram
     shift_bins = set(h.axes[str_axis])
     missing_shifts = set(expected_shifts_bins) - shift_bins
@@ -295,3 +311,63 @@ def add_missing_shifts(
             h.fill(*dummy_fill, weight=0)
             # TODO: this might skip overflow and underflow bins
             h[{str_axis: hist.loc(missing_shift)}] = nominal.view()
+
+
+def update_ax_labels(hists: list[hist.Hist], config_inst: od.Config, variable_name: str) -> None:
+    """
+    Helper function to update the axis labels of histograms based on variable instances from
+    the *config_inst*.
+
+    :param hists: List of histograms to update.
+    :param config_inst: Configuration instance containing variable definitions.
+    :param variable_name: Name of the variable to update labels for, formatted as a string
+                         with variable names separated by hyphens (e.g., "var1-var2").
+    :raises ValueError: If a variable name is not found in the histogram axes.
+    """
+    labels = {}
+    for var_name in variable_name.split("-"):
+        var_inst = config_inst.get_variable(var_name, None)
+        if var_inst:
+            labels[var_name] = var_inst.x_title
+
+    for h in hists:
+        for var_name, label in labels.items():
+            ax_names = [ax.name for ax in h.axes]
+            if var_name in ax_names:
+                h.axes[var_name].label = label
+            else:
+                raise ValueError(f"variable '{var_name}' not found in histogram axes: {h.axes}")
+
+
+def sum_hists(hists: Sequence[hist.Hist]) -> hist.Hist:
+    """
+    Sums a sequence of histograms into a new histogram. In case axis labels differ, which typically leads to errors
+    ("axes not mergable"), the labels of the first histogram are used.
+
+    :param hists: The histograms to sum.
+    :return: The summed histogram.
+    """
+    hists = list(hists)
+    if not hists:
+        raise ValueError("no histograms given for summation")
+
+    # copy the first histogram
+    h_sum = hists[0].copy()
+    if len(hists) == 1:
+        return h_sum
+
+    # store labels of first histogram
+    axis_labels = {ax.name: ax.label for ax in h_sum.axes}
+
+    for h in hists[1:]:
+        # align axis labels if needed, only copy if necessary
+        h_aligned_labels = None
+        for ax in h.axes:
+            if ax.name not in axis_labels or ax.label == axis_labels[ax.name]:
+                continue
+            if h_aligned_labels is None:
+                h_aligned_labels = h.copy()
+            h_aligned_labels.axes[ax.name].label = axis_labels[ax.name]
+        h_sum = h_sum + (h if h_aligned_labels is None else h_aligned_labels)
+
+    return h_sum

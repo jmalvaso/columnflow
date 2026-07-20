@@ -23,7 +23,7 @@ import law
 import order as od
 
 from columnflow.columnar_util import mandatory_coffea_columns, Route, ColumnCollection
-from columnflow.util import get_docs_url, is_regex, prettify, DotDict
+from columnflow.util import get_docs_url, is_regex, prettify, DotDict, freeze
 from columnflow.types import Sequence, Callable, Any, T
 
 
@@ -37,6 +37,11 @@ default_dataset = law.config.get_expanded("analysis", "default_dataset")
 default_repr_max_len = law.config.get_expanded_int("analysis", "repr_max_len")
 default_repr_max_count = law.config.get_expanded_int("analysis", "repr_max_count")
 default_repr_hash_len = law.config.get_expanded_int("analysis", "repr_hash_len")
+
+# cached and parsed sections of the law config for faster lookup
+_cfg_outputs_dict = None
+_cfg_versions_dict = None
+_cfg_resources_dict = None
 
 # placeholder to denote a default value that is resolved dynamically
 RESOLVE_DEFAULT = "DEFAULT"
@@ -130,11 +135,6 @@ class AnalysisTask(BaseTask, law.SandboxTask):
     exclude_params_branch = {"user"}
     exclude_params_workflow = {"user", "notify_slack", "notify_mattermost", "notify_custom"}
 
-    # cached and parsed sections of the law config for faster lookup
-    _cfg_outputs_dict = None
-    _cfg_versions_dict = None
-    _cfg_resources_dict = None
-
     @classmethod
     def modify_param_values(cls, params: dict[str, Any]) -> dict[str, Any]:
         params = super().modify_param_values(params)
@@ -186,13 +186,22 @@ class AnalysisTask(BaseTask, law.SandboxTask):
         # build the params
         params = super().req_params(inst, **kwargs)
 
-        # when not explicitly set in kwargs and no global value was defined on the cli for the task
-        # family, evaluate and use the default value
+        # evaluate and use the default version in case
+        # - "version" is an actual parameter object of cls, and
+        # - "version" is not explicitly set in kwargs, and
+        # - no global value was defined on the cli for the task family, and
+        # - if cls and inst belong to the same family, they differ in the keys used for the config lookup
         if (
             isinstance(getattr(cls, "version", None), luigi.Parameter) and
             "version" not in kwargs and
             not law.parser.global_cmdline_values().get(f"{cls.task_family}_version") and
-            cls.task_family != law.parser.root_task_cls().task_family
+            (
+                cls.task_family != inst.task_family or
+                (
+                    freeze(cls.get_config_lookup_keys(params, significant=True)) !=
+                    freeze(inst.get_config_lookup_keys(inst, significant=True))
+                )
+            )
         ):
             default_version = cls.get_default_version(inst, params)
             if default_version and default_version != law.NO_STR:
@@ -227,17 +236,19 @@ class AnalysisTask(BaseTask, law.SandboxTask):
                         d[part] = {"*": d[part]}
                     d = d[part]
                 else:
-                    # assign value to the last nesting level
-                    if part in d and isinstance(d[part], dict):
-                        d[part]["*"] = value
-                    else:
+                    # assign value to the last nesting level, do not overwrite
+                    if part not in d:
                         d[part] = value
+                    elif isinstance(d[part], dict):
+                        d[part]["*"] = value
 
         return items_dict
 
     @classmethod
     def _get_cfg_outputs_dict(cls) -> dict[str, Any]:
-        if cls._cfg_outputs_dict is None and law.config.has_section("outputs"):
+        global _cfg_outputs_dict
+
+        if _cfg_outputs_dict is None and law.config.has_section("outputs"):
             # collect config item pairs
             skip_keys = {"wlcg_file_systems", "lfn_sources"}
             items = [
@@ -245,26 +256,30 @@ class AnalysisTask(BaseTask, law.SandboxTask):
                 for key, value in law.config.items("outputs")
                 if value and key not in skip_keys
             ]
-            cls._cfg_outputs_dict = cls._structure_cfg_items(items)
+            _cfg_outputs_dict = cls._structure_cfg_items(items)
 
-        return cls._cfg_outputs_dict
+        return _cfg_outputs_dict
 
     @classmethod
     def _get_cfg_versions_dict(cls) -> dict[str, Any]:
-        if cls._cfg_versions_dict is None and law.config.has_section("versions"):
+        global _cfg_versions_dict
+
+        if _cfg_versions_dict is None and law.config.has_section("versions"):
             # collect config item pairs
             items = [
                 (key, value)
                 for key, value in law.config.items("versions")
                 if value
             ]
-            cls._cfg_versions_dict = cls._structure_cfg_items(items)
+            _cfg_versions_dict = cls._structure_cfg_items(items)
 
-        return cls._cfg_versions_dict
+        return _cfg_versions_dict
 
     @classmethod
     def _get_cfg_resources_dict(cls) -> dict[str, Any]:
-        if cls._cfg_resources_dict is None and law.config.has_section("resources"):
+        global _cfg_resources_dict
+
+        if _cfg_resources_dict is None and law.config.has_section("resources"):
             # helper to split resource values into key-value pairs themselves
             def parse(key: str, value: str) -> tuple[str, list[tuple[str, Any]]]:
                 params = []
@@ -288,9 +303,9 @@ class AnalysisTask(BaseTask, law.SandboxTask):
                 for key, value in law.config.items("resources")
                 if value and not key.startswith("_")
             ]
-            cls._cfg_resources_dict = cls._structure_cfg_items(items)
+            _cfg_resources_dict = cls._structure_cfg_items(items)
 
-        return cls._cfg_resources_dict
+        return _cfg_resources_dict
 
     @classmethod
     def get_default_version(cls, inst: AnalysisTask, params: dict[str, Any]) -> str | None:
@@ -340,12 +355,14 @@ class AnalysisTask(BaseTask, law.SandboxTask):
     def get_config_lookup_keys(
         cls,
         inst_or_params: AnalysisTask | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
         """
         Returns a dictionary with keys that can be used to lookup state specific values in a config or dictionary, such
         as default task versions or output locations.
 
         :param inst_or_params: The tasks instance or its parameters.
+        :param significant: Whether only significant keys should be returned.
         :return: A dictionary with keys that can be used for nested lookup.
         """
         keys = law.util.InsertableDict()
@@ -1264,6 +1281,17 @@ class ConfigTask(AnalysisTask):
                     params["config_insts"] = [params["config_inst"]]
             else:
                 if "config_insts" not in params and "configs" in params:
+                    # custom pattern matching
+                    matched_config_names = []
+                    for pattern in params["configs"]:
+                        matched_config_names.extend(
+                            config_name for config_name in analysis_inst.configs.names()
+                            if law.util.multi_match(config_name, pattern)
+                        )
+                    matched_config_names = law.util.make_unique(matched_config_names)
+                    if matched_config_names:
+                        params["configs"] = matched_config_names
+                    # load config instances
                     params["config_insts"] = list(map(analysis_inst.get_config, params["configs"]))
 
         # resolving of parameters that is required before ArrayFunctions etc. can be initialized
@@ -1469,8 +1497,9 @@ class ConfigTask(AnalysisTask):
     def get_config_lookup_keys(
         cls,
         inst_or_params: ConfigTask | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the config name in front of the task family
         config = (
@@ -1650,8 +1679,9 @@ class ShiftTask(ConfigTask):
     def get_config_lookup_keys(
         cls,
         inst_or_params: ShiftTask | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the (global) shift name
         shift = (
@@ -1757,8 +1787,9 @@ class DatasetTask(ShiftTask):
     def get_config_lookup_keys(
         cls,
         inst_or_params: DatasetTask | dict[str, Any],
+        significant: bool = False,
     ) -> law.util.InsertiableDict:
-        keys = super().get_config_lookup_keys(inst_or_params)
+        keys = super().get_config_lookup_keys(inst_or_params, significant=significant)
 
         # add the dataset name before the shift name
         dataset = (

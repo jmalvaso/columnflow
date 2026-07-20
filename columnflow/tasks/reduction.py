@@ -18,7 +18,7 @@ from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.framework.decorators import on_failure
 from columnflow.tasks.external import GetDatasetLFNs
 from columnflow.tasks.selection import CalibrateEvents, SelectEvents
-from columnflow.util import maybe_import, ensure_proxy, dev_sandbox, safe_div
+from columnflow.util import maybe_import, ensure_proxy, dev_sandbox, safe_div, DotDict
 from columnflow.types import Any
 
 ak = maybe_import("awkward")
@@ -74,14 +74,13 @@ class ReduceEvents(_ReduceEvents):
                 if calibrator_inst.produced_columns
             ]
             reqs["selection"] = self.reqs.SelectEvents.req(self)
-            # reducer dependent requirements
-            reqs["reducer"] = law.util.make_unique(law.util.flatten(
-                self.reducer_inst.run_requires(task=self),
-            ))
         else:
             # pass-through pilot workflow requirements of upstream task
             t = self.reqs.SelectEvents.req(self)
-            reqs = law.util.merge_dicts(reqs, t.workflow_requires(), inplace=True)
+            law.util.merge_dicts(reqs, t.workflow_requires(), inplace=True)
+
+        # add reducer dependent requirements
+        reqs["reducer"] = law.util.make_unique(law.util.flatten(self.reducer_inst.run_requires(task=self)))
 
         return reqs
 
@@ -141,6 +140,18 @@ class ReduceEvents(_ReduceEvents):
             reqs=reducer_reqs,
             inputs=luigi.task.getpaths(reducer_reqs),
         )
+
+        # special case for reducers: issue a warning in case the upstream selector has shifts registered that are not
+        # known to the reducer, meaning that requested shifts would be known as global but not local ones, leading to
+        # the nominal behavior in the event chunk loop below, especially regarding alias handling
+        if (missing_reducer_shifts := self.selector_inst.all_shifts - self.reducer_inst.all_shifts):
+            self.logger.warning(
+                f"the upstream selector '{self.selector_inst.cls_name}' has {len(missing_reducer_shifts)} shifts "
+                f"registered that are not known to this reducer '{self.reducer_inst.cls_name}'; please check your "
+                "reducer as this is probably a misconfiguration and can lead to mismatches between event selection and "
+                "reduction, especially when shift-specific aliases are to be applied; missing shifts:\n"
+                f"{', '.join(sorted(missing_reducer_shifts))}",
+            )
 
         # create a temp dir for saving intermediate files
         tmp_dir = law.LocalDirectoryTarget(is_tmp=True)
@@ -213,11 +224,15 @@ class ReduceEvents(_ReduceEvents):
                 )
 
                 # invoke the reducer
-                if len(events):
+                if len(events) > 0:
                     n_all += len(events)
                     events = attach_coffea_behavior(events)
                     events = self.reducer_inst(events, selection=sel, task=self)
                     n_reduced += len(events)
+
+                # no need to proceed when no events are left (except for the last chunk to create empty output)
+                if len(events) == 0 and (output_chunks or pos.index < pos.n_chunks - 1):
+                    continue
 
                 # remove columns
                 events = route_filter(events)
@@ -401,11 +416,14 @@ class MergeReductionStats(_MergeReductionStats):
         # determine the number of files after merging, allowing a possible ~15% increase per file
         n_total = self.dataset_info_inst.n_files
         if n_total > 1:
-            extrapolation = n_total / n
-            n_merged_files = extrapolation * stats["tot_size"] / stats["max_size_merged"]
+            # get the expected number of files after merging
+            n_merged_files = n_total / n * stats["tot_size"] / stats["max_size_merged"]
+            # round using some heuristics
             rnd = math.ceil if n_merged_files % 1.0 > 0.15 else math.floor
             n_merged_files = max(int(rnd(n_merged_files)), 1)
+            # determine the merging factor and adjust the number of merged files accordingly for numeric edge cases
             stats["merge_factor"] = max(math.ceil(n_total / n_merged_files), 1)
+            n_merged_files = max(math.ceil(n_total / stats["merge_factor"]), 1)
         else:
             # trivial case, no merging needed
             n_merged_files = 1
@@ -626,11 +644,15 @@ class ProvideReducedEvents(_ProvideReducedEvents):
                 elif file_merging == 1 and not self.pilot:
                     reqs["events"] = self._req_reduced_events()
 
+        # move reduction stats requirement to the end
+        if "reduction_stats" in reqs:
+            reqs.move_to_end("reduction_stats")
+
         return reqs
 
     def requires(self):
         # same as for workflow requirements without optional pilot check
-        reqs = {}
+        reqs = DotDict()
         if self.skip_merging or (not self.force_merging and self.dataset_info_inst.n_files == 1):
             reqs["events"] = self._req_reduced_events()
         else:
@@ -644,6 +666,10 @@ class ProvideReducedEvents(_ProvideReducedEvents):
                     reqs["events"] = self._req_merged_reduced_events()
                 elif file_merging == 1:
                     reqs["events"] = self._req_reduced_events()
+
+        # move reduction stats requirement to the end
+        if "reduction_stats" in reqs:
+            reqs.move_to_end("reduction_stats")
 
         return reqs
 

@@ -71,7 +71,8 @@
       "profile": "https://github.com/Bogdan-Wiederspan",
       "contributions": [
         "code",
-        "test"
+        "test",
+        "review"
       ]
     },
     {
@@ -153,7 +154,8 @@
       "avatar_url": "https://avatars.githubusercontent.com/u/99343616?v=4",
       "profile": "https://github.com/aalvesan",
       "contributions": [
-        "code"
+        "code",
+        "review"
       ]
     },
     {
@@ -170,6 +172,15 @@
       "name": "Lukas Schaller",
       "avatar_url": "https://avatars.githubusercontent.com/u/30951523?v=4",
       "profile": "https://github.com/LuSchaller",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "Lara813",
+      "name": "lamarkus",
+      "avatar_url": "https://avatars.githubusercontent.com/u/67378765?v=4",
+      "profile": "https://github.com/Lara813",
       "contributions": [
         "code"
       ]

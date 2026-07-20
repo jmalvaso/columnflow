@@ -10,7 +10,6 @@ __all__ = []
 
 import order as od
 
-from columnflow.types import Sequence
 from columnflow.util import maybe_import, try_float
 from columnflow.config_util import group_shifts
 from columnflow.plotting.plot_util import (
@@ -21,12 +20,12 @@ from columnflow.plotting.plot_util import (
     apply_label_placeholders,
     calculate_stat_error,
 )
+from columnflow.types import TYPE_CHECKING, Sequence
 
-hist = maybe_import("hist")
 np = maybe_import("numpy")
-mpl = maybe_import("matplotlib")
-plt = maybe_import("matplotlib.pyplot")
-mplhep = maybe_import("mplhep")
+if TYPE_CHECKING:
+    hist = maybe_import("hist")
+    plt = maybe_import("matplotlib.pyplot")
 
 
 def draw_stat_error_bands(
@@ -71,6 +70,8 @@ def draw_syst_error_bands(
     method: str = "quadratic_sum",
     **kwargs,
 ) -> None:
+    import hist
+
     assert len(h.axes) == 1
     assert method in ("quadratic_sum", "envelope")
 
@@ -84,7 +85,6 @@ def draw_syst_error_bands(
     for up_shift, down_shift in shift_groups.values():
         shift_pairs[up_shift] = down_shift
         shift_pairs[down_shift] = up_shift
-
     # stack histograms separately per shift, falling back to the nominal one when missing
     shift_stacks: dict[od.Shift, hist.Hist] = {}
     for shift_inst in sum(shift_groups.values(), [nominal_shift]):
@@ -118,13 +118,19 @@ def draw_syst_error_bands(
     for b in range(h.axes[0].size):
         up_diffs = []
         down_diffs = []
-        for source, (up_shift, down_shift) in shift_groups.items():
+        for source, (down_shift, up_shift) in shift_groups.items():
             # get actual differences resulting from this shift
             shift_up_diff = shift_stacks[up_shift].values()[b] - shift_stacks[nominal_shift].values()[b]
             shift_down_diff = shift_stacks[down_shift].values()[b] - shift_stacks[nominal_shift].values()[b]
             # store them depending on whether they really increase or decrease the yield
-            up_diffs.append(max(shift_up_diff, shift_down_diff, 0))
-            down_diffs.append(min(shift_up_diff, shift_down_diff, 0))
+            if (shift_up_diff < 0 ) and (shift_down_diff < 0):
+                up_diffs.append(min(shift_up_diff, shift_down_diff))
+            else:
+                up_diffs.append(max(shift_up_diff, shift_down_diff, 0))
+            if (shift_up_diff > 0 ) and (shift_down_diff > 0):
+                down_diffs.append(max(shift_up_diff, shift_down_diff))
+            else:
+                down_diffs.append(min(shift_up_diff, shift_down_diff, 0))
         # combination based on the method
         if method == "quadratic_sum":
             up_diff = sum(d**2 for d in up_diffs)**0.5
@@ -135,7 +141,6 @@ def draw_syst_error_bands(
         # save values
         syst_error_up.append(up_diff)
         syst_error_down.append(down_diff)
-
     # compute relative systematic errors
     rel_syst_error_up = np.array(syst_error_up) / h.values()
     rel_syst_error_up[np.isnan(rel_syst_error_up)] = 0.0
@@ -162,6 +167,102 @@ def draw_syst_error_bands(
     }
     ax.bar(**bar_kwargs)
 
+def draw_total_error_bands(
+    ax: plt.Axes,
+    h: hist.Hist,
+    syst_hists: Sequence[hist.Hist],
+    shift_insts: Sequence[od.Shift],
+    norm: float | Sequence | np.ndarray = 1.0,
+    method: str = "quadratic_sum",
+    default_shift: str | None = None,  
+    **kwargs,
+) -> None:
+    assert len(h.axes) == 1
+    assert method in ("quadratic_sum", "envelope")
+
+    # extra safety in case it still ends up in kwargs for any reason
+    kwargs.pop("default_shift", None)
+    values = h.values().astype(float)
+
+    # stat (symmetric)
+    rel_stat = np.sqrt(h.variances().astype(float)) / values
+    rel_stat = np.nan_to_num(rel_stat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # syst (asymmetric up/down)
+    nominal_shift, shift_groups = group_shifts(shift_insts)
+    if nominal_shift is None:
+        raise ValueError("no nominal shift found in the list of shift instances")
+
+    shift_pairs: dict[od.Shift, od.Shift] = {}
+    for down_shift, up_shift  in shift_groups.values():
+        shift_pairs[down_shift] = down_shift
+        shift_pairs[up_shift] = up_shift
+    shift_stacks: dict[od.Shift, hist.Hist] = {}
+    for shift_inst in sum(shift_groups.values(), []):
+        for _h in syst_hists:
+            shift_ax = _h.axes["shift"]
+            if shift_inst.name in shift_ax:
+                if shift_pairs[shift_inst].name not in shift_ax:
+                    raise RuntimeError(
+                        f"shift {shift_inst} found in histogram but {shift_pairs[shift_inst]} is missing; "
+                        f"existing shifts: {','.join(map(str, list(shift_ax)))}",
+                    )
+                shift_name = shift_inst.name
+            else:
+                shift_name = nominal_shift.name
+
+            _hs = _h[{"shift": hist.loc(shift_name)}]
+            shift_stacks[shift_inst] = _hs if shift_inst not in shift_stacks else (shift_stacks[shift_inst] + _hs)
+
+    syst_up = np.zeros(h.axes[0].size, dtype=float)
+    syst_down = np.zeros(h.axes[0].size, dtype=float)  # magnitude (positive)
+
+    for b in range(h.axes[0].size):
+        up_diffs: list[float] = []
+        down_diffs: list[float] = []
+        for _, (down_shift, up_shift) in shift_groups.items():
+            du = shift_stacks[up_shift].values()[b] - values[b]
+            dd = shift_stacks[down_shift].values()[b] - values[b]
+            if (du < 0 ) and (dd < 0):
+                up_diffs.append(min(du, dd))
+            else:
+                up_diffs.append(max(du, dd, 0.0))
+            if (du > 0 ) and (dd > 0):
+                down_diffs.append(max(du, dd))
+            else:
+                down_diffs.append(min(du, dd, 0.0))
+        if method == "quadratic_sum":
+            syst_up[b] = np.sqrt(sum(d * d for d in up_diffs))
+            syst_down[b] = np.sqrt(sum(d * d for d in down_diffs))  
+        else:  # envelope
+            syst_up[b] = max(up_diffs) if up_diffs else 0.0
+            syst_down[b] = abs(min(down_diffs)) if down_diffs else 0.0
+    
+    rel_syst_up = np.nan_to_num(syst_up / values, nan=0.0, posinf=0.0, neginf=0.0)
+    rel_syst_down = np.nan_to_num(syst_down / values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # total = stat ⊕ syst (quadrature), keep asymmetry
+    rel_tot_up = np.sqrt(rel_stat**2 + rel_syst_up**2)
+    rel_tot_down = np.sqrt(rel_stat**2 + rel_syst_down**2)
+
+    # baseline
+    norm_arr = np.asarray(norm)
+    baseline = np.divide(values, norm_arr, out=np.zeros_like(values, dtype=float), where=(norm_arr != 0))
+    baseline[(values == 0) & (norm_arr == 0)] = 1.0
+    baseline = np.nan_to_num(baseline, nan=0.0, posinf=0.0, neginf=0.0)
+    bar_kwargs = {
+        "x": h.axes[0].centers,
+        "bottom": baseline * (1.0 - rel_tot_down),
+        "height": baseline * (rel_tot_up + rel_tot_down),
+        "width": h.axes[0].edges[1:] - h.axes[0].edges[:-1],
+        "hatch": "xx",
+        "linewidth": 0,
+        "color": "none",
+        "edgecolor": "#30c300",
+        "alpha": 1.0,
+        **kwargs,
+    }
+    ax.bar(**bar_kwargs)
 
 def draw_stack(
     ax: plt.Axes,
@@ -169,6 +270,8 @@ def draw_stack(
     norm: float | Sequence | np.ndarray = 1.0,
     **kwargs,
 ) -> None:
+    import hist
+
     # check if norm is a number
     if try_float(norm):
         h = hist.Stack(*[i / norm for i in h])
@@ -202,6 +305,8 @@ def draw_hist(
     error_type: str = "variance",
     **kwargs,
 ) -> None:
+    import hist
+
     assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
 
     if kwargs.get("color", "") is None:
@@ -243,6 +348,8 @@ def draw_profile(
     """
     Profiled histograms contains the storage type "Mean" and can therefore not be normalized
     """
+    import hist
+
     assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
 
     if kwargs.get("color", "") is None:
@@ -270,8 +377,11 @@ def draw_errorbars(
     h: hist.Hist,
     norm: float | Sequence | np.ndarray = 1.0,
     error_type: str = "poisson_unweighted",
+    density: bool = False,
     **kwargs,
 ) -> None:
+    import hist
+
     assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
 
     values = h.values() / norm
@@ -292,7 +402,7 @@ def draw_errorbars(
                 "Error bars calculation only implemented for histograms with storage type WeightedSum "
                 "either change the Histogram storage_type or set yerr manually",
             )
-        yerr = calculate_stat_error(h, error_type)
+        yerr = calculate_stat_error(h, error_type, density=density)
         # normalize yerr to the histogram = error propagation on standard deviation
         yerr = abs(yerr / norm)
         # replace inf with nan for any bin where norm = 0 and calculate_stat_error returns a non zero value
@@ -342,6 +452,10 @@ def plot_all(
     :param magnitudes: Optional float parameter that defines the displayed ymin when plotting with a logarithmic scale.
     :return: tuple of plot figure and axes
     """
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    import mplhep
+
     # general mplhep style
     plt.style.use(mplhep.style.CMS)
 
@@ -352,13 +466,17 @@ def plot_all(
     rax = None
     grid_spec = {"left": 0.15, "right": 0.95, "top": 0.95, "bottom": 0.1}
     grid_spec |= style_config.get("gridspec_cfg", {})
+
+    # Get figure size from style_config, with default values
+    subplots_cfg = style_config.get("subplots_cfg", {})
+
     if not skip_ratio:
         grid_spec = {"height_ratios": [3, 1], "hspace": 0, **grid_spec}
-        fig, axs = plt.subplots(2, 1, gridspec_kw=grid_spec, sharex=True)
+        fig, axs = plt.subplots(2, 1, gridspec_kw=grid_spec, sharex=True, **subplots_cfg)
         (ax, rax) = axs
     else:
         grid_spec.pop("height_ratios", None)
-        fig, ax = plt.subplots(gridspec_kw=grid_spec)
+        fig, ax = plt.subplots(gridspec_kw=grid_spec, **subplots_cfg)
         axs = (ax,)
 
     # invoke all plots methods
@@ -366,26 +484,27 @@ def plot_all(
         func.__name__: func
         for func in [
             draw_stat_error_bands, draw_syst_error_bands, draw_stack, draw_hist, draw_profile,
-            draw_errorbars,
+            draw_errorbars, draw_total_error_bands,
         ]
     }
     for key, cfg in plot_config.items():
         # check if required fields are present
         if "method" not in cfg:
             raise ValueError(f"no method given in plot_cfg entry {key}")
-        if "hist" not in cfg:
-            raise ValueError(f"no histogram(s) given in plot_cfg entry {key}")
 
         # invoke the method
         method = cfg["method"]
-        h = cfg["hist"]
-        plot_methods[method](ax, h, **cfg.get("kwargs", {}))
+        method_func = method if callable(method) else plot_methods[method]
+        args = (ax, cfg["hist"]) if "hist" in cfg else (ax,)
+        method_func(*args, **cfg.get("kwargs", {}))
 
         # repeat for ratio axes if configured
         if not skip_ratio and "ratio_kwargs" in cfg:
             # take ratio_method if the ratio plot requires a different plotting method
             method = cfg.get("ratio_method", method)
-            plot_methods[method](rax, h, **cfg.get("ratio_kwargs", {}))
+            method_func = method if callable(method) else plot_methods[method]
+            args = (rax, cfg["hist"]) if "hist" in cfg else (rax,)
+            method_func(*args, **cfg.get("ratio_kwargs", {}))
 
     # axis styling
     ax_kwargs = {
@@ -433,7 +552,7 @@ def plot_all(
     if not skip_legend:
         # resolve legend kwargs
         legend_kwargs = {
-            "ncols": 1,
+            "ncols": 2,
             "loc": "upper right",
         }
         legend_kwargs.update(style_config.get("legend_cfg", {}))
