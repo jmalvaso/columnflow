@@ -127,13 +127,16 @@ def muon_sr(
             events.event,
             events.luminosityBlock,
             self.muon_correction_set,
-            rnd_gen="np",
             nested=True,
         )
         events = set_ak_column_f32(events, "Muon.pt", pt_scale_res_corr)
 
         # apply scale and resolution uncertainties to mc
         if self.with_uncertainties and self.muon_cfg.systs:
+            known_systs = {"scale_up", "scale_down", "res_up", "res_down"}
+            if (unknown_systs := set(self.muon_cfg.systs) - known_systs):
+                raise Exception(f"{self.cls_name} calibrator: unknown muon systematic variations {unknown_systs}")
+
             for syst in self.muon_cfg.systs:
                 # the sr tools use up/dn naming
                 sr_direction = {"up": "up", "down": "dn"}[syst.rsplit("_", 1)[-1]]
@@ -149,9 +152,8 @@ def muon_sr(
                         self.muon_correction_set,
                         nested=True,
                     )
-                    events = set_ak_column_f32(events, f"Muon.pt_{syst}", pt_syst)
 
-                elif syst in {"res_up", "res_down"}:
+                else:  # res_up, res_down
                     pt_syst = self.muon_sr_tools.pt_resol_var(
                         pt_scale_corr,
                         pt_scale_res_corr,
@@ -160,16 +162,28 @@ def muon_sr(
                         self.muon_correction_set,
                         nested=True,
                     )
-                    events = set_ak_column_f32(events, f"Muon.pt_{syst}", pt_syst)
 
-                else:
-                    logger.error(f"{self.cls_name} calibrator received unknown systematic '{syst}', skipping")
+                # check for nans
+                if ak.any(invalid := ~np.isfinite(pt_syst)):
+                    msg = (
+                        f"{self.cls_name} calibrator: found {ak.sum(ak.flatten(invalid, axis=None))} muons with "
+                        f"'pt_{syst}' NaN values in {len(pt_syst)} events"
+                    )
+                    if (invalid_frac := ak.mean(ak.any(invalid, axis=1))) >= 0.0005:
+                        raise Exception(f"{msg}, which is in {invalid_frac * 100:.3%} of events")
+                    logger.warning(f"{msg}, setting to nominal values")
+                    pt_syst = ak.where(invalid, pt_scale_res_corr, pt_syst)
+
+                # store
+                events = set_ak_column_f32(events, f"Muon.pt_{syst}", pt_syst)
 
     return events
 
 
 @muon_sr.init
 def muon_sr_init(self: Calibrator, **kwargs) -> None:
+    super(muon_sr, self).init_func(**kwargs)
+
     self.muon_cfg = self.get_muon_sr_config()
 
     # add produced columns with unceratinties if requested
@@ -189,6 +203,8 @@ def muon_sr_requires(
     reqs: dict[str, DotDict[str, Any]],
     **kwargs,
 ) -> None:
+    super(muon_sr, self).requires_func(task=task, reqs=reqs, **kwargs)
+
     if "external_files" in reqs:
         return
 
@@ -205,6 +221,8 @@ def muon_sr_setup(
     reader_targets: law.util.InsertableDict,
     **kwargs,
 ) -> None:
+    super(muon_sr, self).setup_func(task=task, reqs=reqs, inputs=inputs, reader_targets=reader_targets, **kwargs)
+
     # load the correction set
     muon_sr_file = self.get_muon_sr_file(reqs["external_files"].files)
     self.muon_correction_set = load_correction_set(muon_sr_file)

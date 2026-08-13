@@ -11,7 +11,7 @@ import luigi
 
 from columnflow.types import Any, Callable
 from columnflow.tasks.framework.base import ConfigTask, RESOLVE_DEFAULT
-from columnflow.tasks.framework.mixins import VariablesMixin, DatasetsProcessesMixin
+from columnflow.tasks.framework.mixins import VariablesMixin
 from columnflow.tasks.framework.parameters import SettingsParameter, MultiSettingsParameter
 from columnflow.util import DotDict, dict_add_strict, ipython_shell
 
@@ -28,6 +28,7 @@ class PlotBase(ConfigTask):
     file_types = law.CSVParameter(
         default=("pdf",),
         significant=True,
+        brace_expand=True,
         description="comma-separated list of file extensions to produce; default: pdf",
     )
     plot_suffix = luigi.Parameter(
@@ -47,12 +48,13 @@ class PlotBase(ConfigTask):
         description="parameter to set a list of custom plotting parameters; format: "
         "'option1=val1,option2=val2,...'",
     )
-    custom_style_config = luigi.Parameter(
-        default=RESOLVE_DEFAULT,
+    custom_style_config = law.CSVParameter(
+        default=(RESOLVE_DEFAULT,),
         significant=False,
-        description="parameter to overwrite the *style_config* that is passed to the plot function"
-        "via a dictionary in the `custom_style_config_groups` auxiliary in the config; "
-        "defaults to the `default_custom_style_config` aux field",
+        brace_expand=True,
+        description="parameter to overwrite the *style_config* that is passed to the plot function via a dictionary in "
+        "the `custom_style_config_groups` auxiliary in the config; supports multiple comma-separated values; defaults "
+        "to the `default_custom_style_config` aux field",
     )
     skip_legend = law.OptionalBoolParameter(
         default=None,
@@ -79,7 +81,9 @@ class PlotBase(ConfigTask):
         "exceeds a certain threshold; defaults to the `default_blinding_threshold` aux field of "
         "the config",
     )
+
     exclude_params_remote_workflow = {"debug_plot"}
+    exclude_params_hash = {"general_settings"}
 
     @classmethod
     def resolve_param_values(cls, params):
@@ -93,21 +97,21 @@ class PlotBase(ConfigTask):
         # NOTE: we currently assume that general_settings defaults and groups are the same for all
         # config instances
         if "general_settings" in params:
-            settings = params["general_settings"]
-            # when empty and default general_settings are defined, use them instead
-            if not settings and config_inst.x("default_general_settings", ()):
-                settings = config_inst.x("default_general_settings", ())
+            settings = params["general_settings"] or {}
+            if settings:
+                groups = config_inst.x("general_settings_groups", {})
+                settings = groups.get(list(settings.keys())[0], settings)
                 if isinstance(settings, tuple):
                     settings = cls.general_settings.parse(settings)
 
-            # when general_settings are a key to a general_settings_groups, use them instead
-            groups = config_inst.x("general_settings_groups", {})
-            if settings and list(settings.keys())[0] in groups.keys():
-                settings = groups[list(settings.keys())[0]]
-                if isinstance(settings, tuple):
-                    settings = cls.general_settings.parse(settings)
+            # add defaults
+            default_settings = config_inst.x("default_general_settings", ())
+            if isinstance(default_settings, tuple):
+                default_settings = cls.general_settings.parse(default_settings)
+            if default_settings:
+                settings = law.util.merge_dicts(default_settings, settings, deep=True)
 
-            params["general_settings"] = settings
+            params["general_settings"] = DotDict.wrap(settings)
 
         return params
 
@@ -263,19 +267,28 @@ class PlotBase(ConfigTask):
         for key, value in general_settings.items():
             kwargs.setdefault(key, value)
 
-        # resolve custom_style_config
-        custom_style_config = kwargs.get("custom_style_config", None)
-        if custom_style_config == RESOLVE_DEFAULT:
-            custom_style_config = config_inst.x("default_custom_style_config", RESOLVE_DEFAULT)
+        # start building the style config with custom adjustments when a dictionary is given
+        style_config = kwargs.get("style_config") or {}
+        if not isinstance(style_config, dict):
+            self.logger.warning("style_config passed to update_plot_kwargs is not a dictionary, ignoring custom styles")
+        else:
+            # resolve custom_style_config
+            custom_style_config = kwargs.get("custom_style_config")
+            if custom_style_config in {RESOLVE_DEFAULT, (RESOLVE_DEFAULT,)}:
+                custom_style_config = config_inst.x("default_custom_style_config", ())
+            custom_style_config = law.util.make_tuple(custom_style_config) if custom_style_config else ()
 
-        groups = config_inst.x("custom_style_config_groups", {})
-        if isinstance(custom_style_config, str) and custom_style_config in groups.keys():
-            custom_style_config = groups[custom_style_config]
+            # loop over custom styles, look them up in the config, and merge them into style_config
+            groups = config_inst.x("custom_style_config_groups", {})
+            for _custom_style_config in custom_style_config[::-1]:
+                if _custom_style_config not in groups:
+                    raise ValueError(
+                        f"custom_style_config '{_custom_style_config}' not found in custom_style_config_groups of "
+                        f"config '{config_inst.name}'",
+                    )
+                style_config = law.util.merge_dicts(style_config, groups[_custom_style_config], deep=True)
 
-        # update style_config
-        style_config = kwargs.get("style_config", {})
-        if isinstance(custom_style_config, dict) and isinstance(style_config, dict):
-            style_config = law.util.merge_dicts(style_config, custom_style_config)
+            # update style_config in kwargs with the merged style_config
             kwargs["style_config"] = style_config
 
         # update other defaults
@@ -340,6 +353,34 @@ class PlotBase1D(PlotBase):
         dict_add_strict(params, "shape_norm", self.shape_norm)
         dict_add_strict(params, "hide_stat_errors", self.hide_stat_errors)
         dict_add_strict(params, "draw_total_unc", self.draw_total_unc)
+        return params
+
+
+class PlotBase1DWithErrorBands(PlotBase1D):
+
+    legend_title = luigi.Parameter(
+        default=law.NO_STR,
+        significant=False,
+        description="sets the title of the legend; when empty and only one process is present in the plot, the "
+        "process' label is used; empty default",
+    )
+    merge_stat_errors = law.OptionalBoolParameter(
+        default=None,
+        significant=False,
+        description="whether to merge stat error bands into the combined shift error; default: None",
+    )
+    show_syst_rate_change = law.OptionalBoolParameter(
+        default=None,
+        significant=False,
+        description="whether to show rate changing effects of systematics on the stack in the legend; default: None",
+    )
+
+    def get_plot_parameters(self):
+        # convert parameters to usable values during plotting
+        params = super().get_plot_parameters()
+        dict_add_strict(params, "legend_title", None if self.legend_title == law.NO_STR else self.legend_title)
+        dict_add_strict(params, "merge_stat_errors", self.merge_stat_errors)
+        dict_add_strict(params, "show_syst_rate_change", self.show_syst_rate_change)
         return params
 
 
@@ -424,9 +465,7 @@ class PlotBase2D(PlotBase):
 
 
 class ProcessPlotSettingMixin(
-    # TODO: could add back DatasetsProcessesMixin
     PlotBase,
-    DatasetsProcessesMixin,
 ):
     """
     Mixin class for tasks creating plots where contributions of different processes are shown.
@@ -441,6 +480,8 @@ class ProcessPlotSettingMixin(
         "default: value of the 'default_process_settings' if defined, else empty default",
         brace_expand=True,
     )
+
+    exclude_params_hash = {"process_settings"}
 
     @classmethod
     def resolve_param_values(cls, params):
@@ -473,10 +514,8 @@ class ProcessPlotSettingMixin(
         return params
 
     def get_plot_parameters(self) -> DotDict:
-        # convert parameters to usable values during plotting
         params = super().get_plot_parameters()
         dict_add_strict(params, "process_settings", self.process_settings)
-
         return params
 
 
@@ -497,6 +536,8 @@ class VariablePlotSettingMixin(
         "default: value of the 'default_variable_settings' if defined, else empty default",
         brace_expand=True,
     )
+
+    exclude_params_hash = {"variable_settings"}
 
     @classmethod
     def resolve_param_values(cls, params):

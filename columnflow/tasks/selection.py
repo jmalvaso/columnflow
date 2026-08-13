@@ -10,16 +10,15 @@ from collections import defaultdict
 import luigi
 import law
 
-from columnflow.types import Any
-
 from columnflow.tasks.framework.base import Requirements, AnalysisTask, wrapper_factory
 from columnflow.tasks.framework.mixins import CalibratorsMixin, SelectorMixin, ChunkedIOMixin, ProducerMixin
 from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.framework.decorators import on_failure
+from columnflow.tasks.framework.parameters import DerivableInstParameter
 from columnflow.tasks.external import GetDatasetLFNs
 from columnflow.tasks.calibration import CalibrateEvents
 from columnflow.util import maybe_import, ensure_proxy, dev_sandbox, safe_div, DotDict
-from columnflow.tasks.framework.parameters import DerivableInstParameter
+from columnflow.types import Any
 
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
@@ -70,20 +69,16 @@ class SelectEvents(_SelectEvents):
 
         reqs["lfns"] = self.reqs.GetDatasetLFNs.req(self)
 
-        if not self.pilot:
-            reqs["calibrations"] = [
-                self.reqs.CalibrateEvents.req(
-                    self,
-                    calibrator=calibrator_inst.cls_name,
-                    calibrator_inst=calibrator_inst,
-                )
-                for calibrator_inst in self.calibrator_insts
-                if calibrator_inst.produced_columns
-            ]
-        elif self.calibrator_insts:
-            # pass-through pilot workflow requirements of upstream task
-            t = self.reqs.CalibrateEvents.req(self)
-            law.util.merge_dicts(reqs, t.workflow_requires(), inplace=True)
+        # depending on pilot flag, add upstream workflows or pass-through their own requirements only
+        reqs["calibrations"] = list(map(self.pilot_workflow_requires, (
+            self.reqs.CalibrateEvents.req(
+                self,
+                calibrator=calibrator_inst.cls_name,
+                calibrator_inst=calibrator_inst,
+            )
+            for calibrator_inst in self.calibrator_insts
+            if calibrator_inst.produced_columns
+        )))
 
         # add selector dependent requirements
         reqs["selector"] = law.util.make_unique(law.util.flatten(self.selector_inst.run_requires(task=self)))
@@ -105,9 +100,7 @@ class SelectEvents(_SelectEvents):
         }
 
         # add selector dependent requirements
-        reqs["selector"] = law.util.make_unique(law.util.flatten(
-            self.selector_inst.run_requires(task=self),
-        ))
+        reqs["selector"] = law.util.make_unique(law.util.flatten(self.selector_inst.run_requires(task=self)))
 
         return reqs
 
@@ -185,13 +178,15 @@ class SelectEvents(_SelectEvents):
         write_columns |= self.selector_inst.produced_columns
         route_filter = RouteFilter(keep=write_columns)
 
-        # let the lfn_task prepare the nano file (basically determine a good pfn)
-        [(lfn_index, input_file)] = lfn_task.iter_nano_files(self)
+        # let the lfn_task locate and prepare the nano file(s)
+        nano_input = [nano_target for _, nano_target in lfn_task.iter_nano_files(self)]
+        if len(nano_input) == 1:
+            nano_input = nano_input[0]
 
         # prepare inputs for localization
         with law.localize_file_targets(
             [
-                input_file,
+                nano_input,
                 *(inp["columns"] for inp in inputs["calibrations"]),
                 *reader_targets.values(),
             ],
@@ -200,11 +195,18 @@ class SelectEvents(_SelectEvents):
             # iterate over chunks of events and diffs
             n_calib = len(inputs["calibrations"])
             for (events, *cols), pos in self.iter_chunked_io(
-                [inp.abspath for inp in inps],
+                law.util.map_struct(law.target.file.get_path, inps),
                 source_type=["coffea_root"] + ["awkward_parquet"] * n_calib + [None] * n_ext,
+                open_options=self.get_open_options(inps, first_is_nano=True),
+                read_options=self.get_read_options(inps, first_is_nano=True),
                 read_columns=[read_columns] * (1 + n_calib + n_ext),
+                filter_config=self.get_filter_configs(inps, first_is_nano=True),
                 chunk_size=self.selector_inst.get_min_chunk_size(),
             ):
+                # adjust if necessary
+                if callable(self.adjust_chunks):
+                    events, *cols = self.adjust_chunks([events, *cols])
+
                 # optional check for overlapping inputs within additional columns
                 if self.check_overlapping_inputs:
                     self.raise_if_overlapping(list(cols))
@@ -238,8 +240,8 @@ class SelectEvents(_SelectEvents):
                     self.raise_if_not_finite(results_array)
 
                 # save results as parquet via a thread in the same pool
-                chunk = tmp_dir.child(f"res_{lfn_index}_{pos.index}.parquet", type="f")
-                result_chunks[(lfn_index, pos.index)] = chunk
+                chunk = tmp_dir.child(f"res_{pos.index}.parquet", type="f")
+                result_chunks[pos.index] = chunk
                 self.chunked_io.queue(sorted_ak_to_parquet, (results_array, chunk.abspath))
 
                 # remove columns
@@ -251,8 +253,8 @@ class SelectEvents(_SelectEvents):
                         self.raise_if_not_finite(events)
 
                     # save additional columns as parquet via a thread in the same pool
-                    chunk = tmp_dir.child(f"cols_{lfn_index}_{pos.index}.parquet", type="f")
-                    column_chunks[(lfn_index, pos.index)] = chunk
+                    chunk = tmp_dir.child(f"cols_{pos.index}.parquet", type="f")
+                    column_chunks[pos.index] = chunk
                     self.chunked_io.queue(sorted_ak_to_parquet, (events, chunk.abspath))
 
         # teardown the selector
@@ -500,14 +502,10 @@ class MergeSelectionMasks(_MergeSelectionMasks):
         else:
             inputs = [inp["masks"] for inp in inputs]
 
-        law.pyarrow.merge_parquet_task(
-            self, inputs, output["masks"], writer_opts=self.get_parquet_writer_opts(),
-        )
+        law.pyarrow.merge_parquet_task(self, inputs, output["masks"], writer_opts=self.get_parquet_writer_opts())
 
     def zip_results_and_columns(self, inputs, tmp_dir):
-        from columnflow.columnar_util import (
-            Route, RouteFilter, sorted_ak_to_parquet, mandatory_coffea_columns,
-        )
+        from columnflow.columnar_util import Route, RouteFilter, sorted_ak_to_parquet, mandatory_coffea_columns
 
         # setup the normalization weights producer
         if self.dataset_inst.is_mc:

@@ -19,19 +19,25 @@ ak = maybe_import("awkward")
 
 logger = law.logger.get_logger(__name__)
 
-_keep_gen_part_fields = ["pt", "eta", "phi", "mass", "pdgId"]
+_keep_gen_part_fields = {
+    "pt": np.float32,
+    "eta": np.float32,
+    "phi": np.float32,
+    "mass": np.float32,
+    "pdgId": np.int32,
+}
 
 
 # helper to transform generator particles by dropping / adding fields
 def transform_gen_part(gen_parts: ak.Array, *, depth_limit: int, optional: bool = False) -> ak.Array:
     # reduce down to relevant fields
     arr = {}
-    for f in _keep_gen_part_fields:
+    for f, dtype in _keep_gen_part_fields.items():
         if optional:
             if (v := getattr(gen_parts, f, UNSET)) is not UNSET:
-                arr[f] = v
+                arr[f] = ak.values_astype(v, dtype)
         else:
-            arr[f] = getattr(gen_parts, f)
+            arr[f] = ak.values_astype(getattr(gen_parts, f), dtype)
     arr = ak.zip(arr, depth_limit=depth_limit)
 
     # remove parameters and add Lorentz vector behavior
@@ -160,8 +166,11 @@ def gen_higgs_lookup(self: Producer, events: ak.Array, strict: bool = True, **kw
         - ``tau_w_children``: list of the decay products from W boson decays from tau lepton decays, with the first
             entry being the down-type quark or charged lepton, the second entry being the up-type quark or neutrino, and
             additional decay products (e.g photons) are appended afterwards
-        - ``z_children``: not yet implemented
-        - ``w_children``: not yet implemented
+        - ``w_children``: list of decay products from W boson decays coming from Higgs bosons, with the first entry
+                being the down-type quark or charged lepton, the second entry being the up-type quark or neutrino, and
+                additional decay products (e.g photons) are appended afterwards
+        - ``z_children``: list of decay products from Z boson decays coming from Higgs bosons, with the first entry
+                being the particle and the second entry being the anti-particle
     """
     # helper to extract unique values
     unique_set = lambda a: set(np.unique(ak.flatten(a, axis=None)))
@@ -187,8 +196,8 @@ def gen_higgs_lookup(self: Producer, events: ak.Array, strict: bool = True, **kw
     if strict:
         h_children = h_children[:, :, [0, 1]]
 
-    # further treatment of tau decays
-    tau_mask = h_children.pdgId[:, :, 0] == 15
+    # h -> tautau -> children
+    tau_mask = abs(h_children.pdgId[:, :, 0]) == 15
     tau = ak.fill_none(h_children[ak.mask(tau_mask, tau_mask)], [], axis=1)
     tau_children = tau.distinctChildrenDeep[tau.distinctChildrenDeep.hasFlags("isFirstCopy", "isTauDecayProduct")]
     tau_children = ak.drop_none(tau_children)
@@ -221,8 +230,20 @@ def gen_higgs_lookup(self: Producer, events: ak.Array, strict: bool = True, **kw
         axis=2,
     )
 
+    # h -> ww -> children
+    w_mask = abs(h_children.pdgId[:, :, 0]) == 24
+    w = ak.fill_none(h_children[ak.mask(w_mask, w_mask)], [], axis=1)
+    w_children = w.distinctChildrenDeep[w.distinctChildrenDeep.hasFlags("fromHardProcess", "isFirstCopy")]
+    w_children = ak.drop_none(w_children)
+
+    # h -> zz -> children
+    z_mask = abs(h_children.pdgId[:, :, 0]) == 23
+    z = ak.fill_none(h_children[ak.mask(z_mask, z_mask)], [], axis=1)
+    z_children = z.distinctChildrenDeep[z.distinctChildrenDeep.hasFlags("fromHardProcess", "isFirstCopy")]
+    z_children = ak.drop_none(z_children)
+
     # children for decays other than taus are not yet implemented, so show a warning in case they are found
-    unhandled_ids = unique_set(abs(h_children.pdgId)) - set(range(1, 6 + 1)) - set(range(11, 16 + 1))
+    unhandled_ids = unique_set(abs(h_children.pdgId)) - set(range(1, 6 + 1)) - set(range(11, 16 + 1)) - {23, 24}
     if unhandled_ids:
         logger.warning_once(
             f"gen_higgs_undhandled_children_{'_'.join(map(str, sorted(unhandled_ids)))}",
@@ -237,8 +258,8 @@ def gen_higgs_lookup(self: Producer, events: ak.Array, strict: bool = True, **kw
             "h_children": transform_gen_part(h_children, depth_limit=3),
             "tau_children": transform_gen_part(tau_nuw, depth_limit=4),
             "tau_w_children": transform_gen_part(tau_w_children, depth_limit=4),
-            # "z_children": None,  # not yet implemented
-            # "w_children": None,  # not yet implemented
+            "w_children": transform_gen_part(w_children, depth_limit=4),
+            "z_children": transform_gen_part(z_children, depth_limit=4),
         },
         depth_limit=1,
     )
@@ -269,10 +290,22 @@ def gen_dy_lookup(self: Producer, events: ak.Array, strict: bool = True, **kwarg
         - ``tau_w_children``: list of the decay products from W boson decays from tau lepton decays, with the first
             entry being the down-type quark or charged lepton, the second entry being the up-type quark or neutrino, and
             additional decay products (e.g photons) are appended afterwards
+        - ``decay_type``: integer value describing the following cases:
+            - ee: 1
+            - mm: 2
+            - tt:
+                - ee: 113
+                - em: 123
+                - eh: 133
+                - me: 213
+                - mm: 223
+                - mh: 233
+                - he: 313
+                - hm: 323
+                - hh: 333
     """
     # note: in about 4% of DY events, the Z/g boson is missing, so this lookup starts at lepton level, see
-    # -> https://indico.cern.ch/event/1495537/contributions/6359516/attachments/3014424/5315938/HLepRare_25.02.14.pdf
-    # -> https://indico.cern.ch/event/1495537/contributions/6359516/attachments/3014424/5315938/HLepRare_25.02.14.pdf
+    # https://indico.cern.ch/event/1495537/contributions/6359516/attachments/3014424/5315938/HLepRare_25.02.14.pdf
 
     # helper to extract unique values
     unique_set = lambda a: set(np.unique(ak.flatten(a, axis=None)))
@@ -311,6 +344,7 @@ def gen_dy_lookup(self: Producer, events: ak.Array, strict: bool = True, **kwarg
 
     # further treatment of tau decays
     tau = events.GenPart[tau_mask]
+    tau = tau[ak.argsort(tau.pdgId, axis=1, ascending=False)]
     tau_children = tau.distinctChildren[tau.distinctChildren.hasFlags("isFirstCopy", "isTauDecayProduct")]
     tau_children = ak.drop_none(tau_children)
     # prepare neutrino and W boson handling
@@ -342,6 +376,27 @@ def gen_dy_lookup(self: Producer, events: ak.Array, strict: bool = True, **kwarg
         axis=1,
     )
 
+    # construct the decay type integer
+    first_lep_id = abs(lep.pdgId[:, 0])
+    t_mask = first_lep_id == 15
+    min_tau_1_w_children_id = ak.fill_none(ak.min(ak.firsts(abs(tau_w_children.pdgId)[:, 0:1]), axis=1), np.int32(0))
+    min_tau_2_w_children_id = ak.fill_none(ak.min(ak.firsts(abs(tau_w_children.pdgId)[:, 1:2]), axis=1), np.int32(0))
+    decay_type = (
+        np.zeros(len(events), np.uint16) +
+        # add values for overall z decay: e=1, m=2, t=3
+        ak.where(first_lep_id == 11, 1, 0) +
+        ak.where(first_lep_id == 13, 2, 0) +
+        ak.where(t_mask, 3, 0) +
+        # add values for the first tau decay into: e=100, m=200, h=300
+        ak.where(t_mask & (min_tau_1_w_children_id == 11), 100, 0) +
+        ak.where(t_mask & (min_tau_1_w_children_id == 13), 200, 0) +
+        ak.where(t_mask & (min_tau_1_w_children_id > 16), 300, 0) +
+        # add values for the second tau decay into: e=10, m=20, h=30
+        ak.where(t_mask & (min_tau_2_w_children_id == 11), 10, 0) +
+        ak.where(t_mask & (min_tau_2_w_children_id == 13), 20, 0) +
+        ak.where(t_mask & (min_tau_2_w_children_id > 16), 30, 0)
+    )
+
     # zip into a single array with named fields
     gen_dy = ak.zip(
         {
@@ -349,6 +404,7 @@ def gen_dy_lookup(self: Producer, events: ak.Array, strict: bool = True, **kwarg
             "lep": transform_gen_part(lep, depth_limit=2),
             "tau_children": transform_gen_part(tau_nuw, depth_limit=3),
             "tau_w_children": transform_gen_part(tau_w_children, depth_limit=3),
+            "decay_type": ak.values_astype(decay_type, np.uint16),
         },
         depth_limit=1,
     )
@@ -357,3 +413,94 @@ def gen_dy_lookup(self: Producer, events: ak.Array, strict: bool = True, **kwarg
     events = set_ak_column(events, "gen_dy", gen_dy)
 
     return events
+
+
+@producer(
+    uses={
+        gen_dy_lookup,
+        "GenPart.{genPartIdxMother,status,statusFlags}",  # required by the gen particle identification
+        f"GenPart.{{{','.join(_keep_gen_part_fields)}}}",  # additional fields that should be read and added to gen_top
+    },
+    produces={"gen_dy_hepmc_filters"},
+)
+def gen_dy_hepmc_filters(self: Producer, events: ak.Array, **kwargs) -> ak.Array:
+    """
+    Evaluates certain HepMC filters for DY events. The result is stored as a bit mask for specific filter
+    implementations.
+    """
+    # add dy indexing
+    events = self[gen_dy_lookup](events, **kwargs)
+
+    # start with zeros
+    hepmc_filters = np.zeros(len(events), np.uint8)
+
+    # set bits for events passing the respective filters
+    hepmc_filters += np.asarray(hepmc_filter_1(events), dtype=np.uint8) << 0
+    # no others yet to be placed on higher bits
+
+    events = set_ak_column(events, "gen_dy_hepmc_filters", hepmc_filters)
+
+    return events
+
+
+def hepmc_filter_1(events: ak.Array) -> np.ndarray:
+    """
+    Checks if the event contains a di-tau system and applies kinematic cuts.
+
+    Example    : DYto2Tau-2Jets_M-50_2J_Filtered_TuneCP5_13p6TeV_amcatnloFXFX-pythia8
+    HepMCFilter: https://github.com/cms-sw/cmssw/blob/master/GeneratorInterface/Core/src/EmbeddingHepMCFilter.cc
+    Filter cuts: https://cms-pdmv-prod.web.cern.ch/mcm/public/restapi/requests/get_fragment/HIG-Run3Summer22EEwmLHEGS-01476/0 # noqa: E501
+    """
+    # get taus with "isHardProcess" flag
+    tau = events.GenPart[(abs(events.GenPart.pdgId) == 15) & (events.GenPart.hasFlags("isHardProcess"))]
+
+    # when there are no taus, stop early
+    if not ak.any(ak.num(tau, axis=1)):
+        return np.zeros(len(events), dtype=np.bool_)
+
+    # sort tau before anti-tau to be consistent with decay_type definition in gen_dy_lookup
+    tau = tau[ak.argsort(tau.pdgId, axis=1, ascending=False)]  # sort by tau before anti-tau
+
+    # iterate as long as there are children, starting with first level of tau children
+    visible = []
+    children = tau.distinctChildrenDeep
+    while (ak.max(ak.num(children, axis=2), axis=None) or 0) > 0:
+        # remove nus
+        abs_id = abs(children.pdgId)
+        nu_mask = (abs_id == 12) | (abs_id == 14) | (abs_id == 16)
+        children = children[~nu_mask]
+        # save visible particles to book keeping sums
+        status_mask = children.status == 1
+        visible.append(children[status_mask])
+        # continue with concated rest
+        children = ak.flatten(children[~status_mask].children, axis=3)
+
+    # combine to visible tau momenta and extract pt and eta
+    vis_tau = ak.concatenate(visible, axis=2).sum(axis=2)
+    pt = ak.fill_none(ak.pad_none(vis_tau.pt, 2, axis=1, clip=True), 0.0)
+    eta = ak.fill_none(ak.pad_none(abs(vis_tau.eta), 2, axis=1, clip=True), 5.0)
+
+    # apply channel dependent cuts, without ordering but repeating orientations
+    dt = events.gen_dy.decay_type
+    decision = (
+        (dt % 10 == 3) &  # tautau
+        ak.all(eta < 3.0, axis=1) &  # all eta's below 3.0
+        (
+            # em
+            ((dt == 123) & (pt[:, 0] > 11.0) & (pt[:, 1] > 8.0)) |
+            # eh
+            ((dt == 133) & (pt[:, 0] > 22.0) & (pt[:, 1] > 16.0)) |
+            # me
+            ((dt == 213) & (pt[:, 0] > 8.0) & (pt[:, 1] > 11.0)) |
+            # mh
+            ((dt == 233) & (pt[:, 0] > 19.0) & (pt[:, 1] > 16.0)) |
+            # he
+            ((dt == 313) & (pt[:, 0] > 16.0) & (pt[:, 1] > 22.0)) |
+            # hm
+            ((dt == 323) & (pt[:, 0] > 16.0) & (pt[:, 1] > 19.0)) |
+            # hh
+            ((dt == 333) & (pt[:, 0] > 20) & (pt[:, 1] > 20))  # order not important as cuts are the same
+        )
+    )
+
+    return decision

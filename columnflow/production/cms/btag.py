@@ -13,7 +13,7 @@ import order as od
 
 from columnflow.production import Producer, producer
 from columnflow.columnar_util import set_ak_column, DotDict, TAFConfig, EMPTY_FLOAT
-from columnflow.hist_util import sum_hists
+from columnflow.hist_util import sum_hists, merge_axis_bins
 from columnflow.util import maybe_import, load_correction_set
 from columnflow.types import Any, Callable, Sequence
 
@@ -270,6 +270,7 @@ def btag_weights_post_init(self: Producer, task: law.Task, **kwargs) -> None:
     #   2. when the nominal shift is requested, the central weight and all variations related to the
     #      method-intrinsic shifts are produced
     #   3. when any other shift is requested, only create the central weight column
+    super(btag_weights, self).post_init_func(task=task, **kwargs)
 
     # NOTE: we currently setup the produced columns only during the post_init. This means
     # that the `produces` of this Producer will be empty during task initialization, meaning
@@ -323,6 +324,8 @@ def btag_weights_requires(
     reqs: dict[str, DotDict[str, Any]],
     **kwargs,
 ) -> None:
+    super(btag_weights, self).requires_func(task=task, reqs=reqs, **kwargs)
+
     if "external_files" in reqs:
         return
 
@@ -339,6 +342,8 @@ def btag_weights_setup(
     reader_targets: law.util.InsertableDict,
     **kwargs,
 ) -> None:
+    super(btag_weights, self).setup_func(task=task, reqs=reqs, inputs=inputs, reader_targets=reader_targets, **kwargs)
+
     # load the btag sf corrector
     btag_file = self.get_btag_file(reqs["external_files"].files)
     self.btag_sf_corrector = load_correction_set(btag_file)[self.btag_config.correction_set]
@@ -365,6 +370,9 @@ class BTagWPSFConfig(TAFConfig):
     # ! note that, when given, these edges need to be a valid subset of the original bin edges of the counting hists
     pt_edges: tuple[float, ...] | None = None
     abs_eta_edges: tuple[float, ...] | None = None
+    # same for merging working points in a dictionary like {"xtight": ["xtight", "xxtight"]} to merge xtight and xxtight
+    # and call the resulting bin on the "wp" axis "xtight"
+    wp_merging: dict[str, Sequence[str]] = dataclasses.field(default_factory=dict)
     # key of the tagging counts histogram to load from MergeSelectionStats output
     hist_key: str = "btag_wp_counts"
     # name of the weight column to produce
@@ -440,11 +448,11 @@ def btag_wp_weights(
         2. https://cms-analysis-corrections.docs.cern.ch/corrections_era/Run3-24CDEReprocessingFGHIPrompt-Summer24-NanoAODv15/BTV/2026-01-30/#btagging_preliminaryjsongz  # noqa
         3. https://indico.cern.ch/event/1583955/contributions/6771046/attachments/3176162/5648591/BTVreportHIGPAG_18112025.pdf  # noqa
     """
-    # get inputs
-    discr = events.Jet[self.cfg.btag_column]
-    flavor = events[self.cfg.jet_name].hadronFlavour
-    abs_eta = abs(events[self.cfg.jet_name].eta)
-    pt = events[self.cfg.jet_name].pt
+    # get inputs, evaluated at jet_mask
+    discr = events[self.cfg.jet_name][self.cfg.btag_column][jet_mask]
+    flavor = events[self.cfg.jet_name].hadronFlavour[jet_mask]
+    abs_eta = abs(events[self.cfg.jet_name].eta[jet_mask])
+    pt = events[self.cfg.jet_name].pt[jet_mask]
 
     # helpers to get the sf and efficiencies
     def get_sf_and_eff(
@@ -564,6 +572,8 @@ def btag_wp_weights(
 
 @btag_wp_weights.init
 def btag_wp_weights_init(self: Producer, **kwargs) -> None:
+    super(btag_wp_weights, self).init_func(**kwargs)
+
     self.cfg = self.get_btag_wp_sf_config()
 
     # keep a list of all dataset insts whose tagging counts should be grouped (summed)
@@ -575,7 +585,7 @@ def btag_wp_weights_init(self: Producer, **kwargs) -> None:
             (dataset if isinstance(dataset, od.Dataset) else self.config_inst.get_dataset(dataset))
             for dataset in group
         ]
-        logger.info_once(
+        logger.debug_once(
             log_id,
             f"{self.cls_name}: found {len(group)} dataset(s) for grouping tagging counts for requested dataset "
             f"'{self.dataset_inst.name}': {', '.join(dataset.name for dataset in group)}",
@@ -592,6 +602,8 @@ def btag_wp_weights_init(self: Producer, **kwargs) -> None:
 
 @btag_wp_weights.post_init
 def btag_wp_weights_post_init(self: Producer, task: law.Task, **kwargs) -> None:
+    super(btag_wp_weights, self).post_init_func(task=task, **kwargs)
+
     # add used columns
     self.uses.add(f"{self.cfg.jet_name}.{{pt,eta,phi,mass,hadronFlavour,{self.cfg.btag_column}}}")
 
@@ -611,6 +623,8 @@ def btag_wp_weights_requires(
     reqs: dict[str, DotDict[str, Any]],
     **kwargs,
 ) -> None:
+    super(btag_wp_weights, self).requires_func(task=task, reqs=reqs, **kwargs)
+
     if "external_files" not in reqs:
         from columnflow.tasks.external import BundleExternalFiles
         reqs["external_files"] = BundleExternalFiles.req(task)
@@ -636,6 +650,14 @@ def btag_wp_weights_setup(
     reader_targets: law.util.InsertableDict,
     **kwargs,
 ) -> None:
+    super(btag_wp_weights, self).setup_func(
+        task=task,
+        reqs=reqs,
+        inputs=inputs,
+        reader_targets=reader_targets,
+        **kwargs,
+    )
+
     import hist
     import correctionlib as clib
     import correctionlib.convert
@@ -654,6 +676,9 @@ def btag_wp_weights_setup(
         counts = counts[{"pt": hist.rebin(edges=self.cfg.pt_edges)}]
     if self.cfg.abs_eta_edges:
         counts = counts[{"abs_eta": hist.rebin(edges=self.cfg.abs_eta_edges)}]
+    # merge wp bins if necessary
+    for merged_wp, wps in self.cfg.wp_merging.items():
+        counts = merge_axis_bins(counts, "wp", merged_wp, wps)
     # get the total counts
     counts_total = counts[{"wp": "total"}].view()
     # compute efficiencies
@@ -666,7 +691,9 @@ def btag_wp_weights_setup(
     # convert to clib corrector
     effs.name = "btag_efficiencies"
     effs.label = "eff"
-    self.wp_eff_corrector = clib.convert.from_histogram(effs).to_evaluator()
+    cset = clib.convert.from_histogram(effs)
+    cset.data.flow = "clamp"  # clamps the pt and abs eta axis
+    self.wp_eff_corrector = cset.to_evaluator()
 
     # dictionary for BTV naming scheme compatibility
     self.convert_wp_str = {

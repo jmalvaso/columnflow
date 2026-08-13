@@ -24,6 +24,12 @@ from columnflow.util import UNSET, real_path
 from columnflow.types import Any
 
 
+# helpers to join paths relative to some base directories
+_cf_path = lambda *p: os.path.join(os.environ["CF_BASE"], *map(str, p))
+_repo_path = lambda *p: os.path.join(os.environ["CF_REPO_BASE"], *map(str, p))
+_cf_repo_path = lambda *p: [_cf_path(*p), _repo_path(*p)]
+
+
 class BundleRepo(AnalysisTask, law.git.BundleGitRepository, law.tasks.TransferLocalFile):
 
     replicas = luigi.IntParameter(
@@ -34,16 +40,19 @@ class BundleRepo(AnalysisTask, law.git.BundleGitRepository, law.tasks.TransferLo
     version = None
 
     exclude_files = [
-        "docs",
-        "tests",
-        "data",
-        "assets",
-        ".law",
-        ".setups",
-        ".data",
-        ".github",
-        # also make sure that CF specific files that are not part of
-        # the repository are excluded
+        # excluded from cf _and_ analysis repos
+        *_cf_repo_path("docs"),
+        *_cf_repo_path("tests"),
+        *_cf_repo_path("data"),
+        *_cf_repo_path("tmp"),
+        *_cf_repo_path(".data"),
+        *_cf_repo_path(".github"),
+        # excluded from cf repo
+        _cf_path("assets"),
+        # excluded from analysis repo
+        _repo_path(".law", "cms"),
+        _repo_path(".setups"),
+        # also make sure that CF specific files that are not part of the repository are excluded
         os.environ["CF_STORE_LOCAL"],
         os.environ["CF_SOFTWARE_BASE"],
         os.environ["CF_VENV_BASE"],
@@ -51,7 +60,8 @@ class BundleRepo(AnalysisTask, law.git.BundleGitRepository, law.tasks.TransferLo
     ]
 
     include_files = [
-        "law_user.cfg",
+        _repo_path("law_user.cfg"),
+        _repo_path(".law"),
     ]
 
     def get_repo_path(self):
@@ -366,6 +376,7 @@ class RemoteWorkflowMixin(AnalysisTask):
     skip_destination_info: bool = False
 
     exclude_params_req = {"remote_claw_sandbox"}
+    exclude_params_branch = {"remote_claw_sandbox"}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -565,7 +576,7 @@ class RemoteWorkflowMixin(AnalysisTask):
         # forward voms proxy
         if voms:
             # when skipping the check, still send it if the proxy exists and is valid, otherwise enforce it
-            skip_check = law.config.get_expanded_boolean("analysis", "skip_ensure_proxy", False)
+            skip_check = law.config.get_expanded_bool("analysis", "skip_ensure_proxy", False)
             vomsproxy_file = law.wlcg.get_vomsproxy_file()
             vomsproxy_exists = os.path.isfile(vomsproxy_file)
             vomsproxy_valid = vomsproxy_exists and law.wlcg.check_vomsproxy_validity(proxy_file=vomsproxy_file)
@@ -665,7 +676,7 @@ class RemoteWorkflowMixin(AnalysisTask):
 
 
 _default_htcondor_flavor = law.config.get_expanded("analysis", "htcondor_flavor", law.NO_STR)
-_default_htcondor_share_software = law.config.get_expanded_boolean("analysis", "htcondor_share_software", False)
+_default_htcondor_share_software = law.config.get_expanded_bool("analysis", "htcondor_share_software", False)
 _default_htcondor_memory = law.util.parse_bytes(
     law.config.get_expanded("analysis", "htcondor_memory", law.NO_FLOAT),
     input_unit="GB",
@@ -765,6 +776,7 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
         "CF_STORE_NAME": "cf_store_name",
         "CF_STORE_LOCAL": "cf_store_local",
         "CF_LOCAL_SCHEDULER": "cf_local_scheduler",
+        "CF_PYTHON_VERSION": "cf_python_version",
     }
 
     # whether to show a memory summary histogram after workflow completion
@@ -976,6 +988,7 @@ class HTCondorWorkflow(RemoteWorkflowMixin, law.htcondor.HTCondorWorkflow):
 
         # request memory
         if self.htcondor_memory is not None and self.htcondor_memory > 0:
+            config.custom_content.append(("RequestMemory", f"{self.htcondor_memory} Gb"))
             config.custom_content.append(("Request_Memory", f"{self.htcondor_memory} Gb"))
 
         # request disk space
@@ -1076,6 +1089,7 @@ class SlurmWorkflow(RemoteWorkflowMixin, law.slurm.SlurmWorkflow):
         "CF_STORE_NAME": "cf_store_name",
         "CF_STORE_LOCAL": "cf_store_local",
         "CF_LOCAL_SCHEDULER": "cf_local_scheduler",
+        "CF_PYTHON_VERSION": "cf_python_version",
     }
 
     # upstream requirements

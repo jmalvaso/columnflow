@@ -8,6 +8,7 @@ from __future__ import annotations
 
 __all__ = []
 
+import law
 import order as od
 
 from columnflow.util import maybe_import, try_float
@@ -19,6 +20,8 @@ from columnflow.plotting.plot_util import (
     remove_label_placeholders,
     apply_label_placeholders,
     calculate_stat_error,
+    HatchStyles,
+    get_hatch_kwargs,
 )
 from columnflow.types import TYPE_CHECKING, Sequence
 
@@ -32,9 +35,11 @@ def draw_stat_error_bands(
     ax: plt.Axes,
     h: hist.Hist,
     norm: float | Sequence | np.ndarray = 1.0,
+    hatch_style: HatchStyles = "black",
     **kwargs,
 ) -> None:
-    assert len(h.axes) == 1
+    if len(h.axes) != 1:
+        raise ValueError("draw_stat_error_bands only supports 1D histograms")
 
     # compute relative statistical errors
     rel_stat_error = h.variances()**0.5 / h.values()
@@ -46,18 +51,21 @@ def draw_stat_error_bands(
     baseline[(h.values() == 0) & (norm == 0)] = 1.0
     baseline[np.isnan(baseline)] = 0.0
 
+    # create bar plot args
     bar_kwargs = {
         "x": h.axes[0].centers,
         "bottom": baseline * (1 - rel_stat_error),
         "height": baseline * 2 * rel_stat_error,
         "width": h.axes[0].edges[1:] - h.axes[0].edges[:-1],
-        "hatch": "///",
-        "linewidth": 0,
-        "color": "none",
-        "edgecolor": "black",
-        "alpha": 1.0,
+        **get_hatch_kwargs(hatch_style),
         **kwargs,
     }
+
+    # evaluate label placeholders
+    if "label" in bar_kwargs:
+        bar_kwargs["label"] = remove_label_placeholders(apply_label_placeholders(bar_kwargs["label"]))
+
+    # plot
     ax.bar(**bar_kwargs)
 
 
@@ -68,12 +76,16 @@ def draw_syst_error_bands(
     shift_insts: Sequence[od.Shift],
     norm: float | Sequence | np.ndarray = 1.0,
     method: str = "quadratic_sum",
+    hatch_style: HatchStyles = "green_backwards",
+    show_rate_change: bool = False,
     **kwargs,
 ) -> None:
     import hist
 
-    assert len(h.axes) == 1
-    assert method in ("quadratic_sum", "envelope")
+    if len(h.axes) != 1:
+        raise ValueError("draw_syst_error_bands only supports 1D histograms")
+    if method not in (known_methods := {"quadratic_sum", "envelope"}):
+        raise ValueError(f"method must be one of {known_methods}, not {method}")
 
     nominal_shift, shift_groups = group_shifts(shift_insts)
     if nominal_shift is None:
@@ -153,18 +165,34 @@ def draw_syst_error_bands(
     baseline[(h.values() == 0) & (norm == 0)] = 1.0
     baseline[np.isnan(baseline)] = 0.0
 
+    # create bar plot args
     bar_kwargs = {
         "x": h.axes[0].centers,
         "bottom": baseline * (1 - rel_syst_error_down),
         "height": baseline * (rel_syst_error_up + rel_syst_error_down),
         "width": h.axes[0].edges[1:] - h.axes[0].edges[:-1],
-        "hatch": "\\\\\\",
-        "linewidth": 0,
-        "color": "none",
-        "edgecolor": "#30c300",
-        "alpha": 1.0,
+        **get_hatch_kwargs(hatch_style),
         **kwargs,
     }
+
+    # optionally add integral change to label
+    if show_rate_change and isinstance(norm, (float, int)) and norm == 1:
+        up_effect = round((baseline * (1 + rel_syst_error_up)).sum() / baseline.sum() - 1, 3)
+        down_effect = round((baseline * (1 - rel_syst_error_down)).sum() / baseline.sum() - 1, 3)
+        if up_effect == -down_effect:
+            effect_str = fr"($\pm${up_effect * 100:.1f}%)"
+        else:
+            effect_str = f"({up_effect * 100:+.1f}/{down_effect * 100:+.1f}%)"
+        if "label" in bar_kwargs:
+            bar_kwargs["label"] += f"__BREAK__{effect_str}"
+        else:
+            bar_kwargs["label"] = effect_str
+
+    # evaluate label placeholders
+    if "label" in bar_kwargs:
+        bar_kwargs["label"] = remove_label_placeholders(apply_label_placeholders(bar_kwargs["label"]))
+
+    # plot
     ax.bar(**bar_kwargs)
 
 def draw_total_error_bands(
@@ -302,12 +330,15 @@ def draw_hist(
     ax: plt.Axes,
     h: hist.Hist,
     norm: float | Sequence | np.ndarray = 1.0,
-    error_type: str = "variance",
+    error_type: str | None = "variance",
     **kwargs,
 ) -> None:
     import hist
 
-    assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
+    if error_type is None:
+        error_type = "none"
+    if error_type not in (known_error_types := {"none", "variance", "poisson_unweighted", "poisson_weighted"}):
+        raise ValueError(f"error_type must be one of {known_error_types}, not {error_type}")
 
     if kwargs.get("color", "") is None:
         # when color is set to None, remove it such that matplotlib automatically chooses a color
@@ -319,18 +350,20 @@ def draw_hist(
         "histtype": "step",
     }
     defaults.update(kwargs)
-    if "yerr" not in defaults:
+
+    if error_type == "none":
+        defaults.pop("yerr", None)
+    elif defaults.get("yerr") is None:
         if h.storage_type.accumulator is not hist.accumulators.WeightedSum:
             raise TypeError(
-                "Error bars calculation only implemented for histograms with storage type WeightedSum "
-                "either change the Histogram storage_type or set yerr manually",
+                "error bar calculation only implemented for histograms with storage type WeightedSum either change "
+                "the histogram storage_type or set yerr manually",
             )
         yerr = calculate_stat_error(h, error_type)
         # normalize yerr to the histogram = error propagation on standard deviation
         yerr = abs(yerr / norm)
         # replace inf with nan for any bin where norm = 0 and calculate_stat_error returns a non zero value
-        if np.any(np.isinf(yerr)):
-            yerr[np.isinf(yerr)] = np.nan
+        yerr[np.isinf(yerr)] = np.nan
         defaults["yerr"] = yerr
 
     h = h / norm
@@ -342,7 +375,7 @@ def draw_profile(
     ax: plt.Axes,
     h: hist.Hist,
     norm: float | Sequence | np.ndarray = 1.0,
-    error_type: str = "variance",
+    error_type: str | None = "variance",
     **kwargs,
 ) -> None:
     """
@@ -350,7 +383,10 @@ def draw_profile(
     """
     import hist
 
-    assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
+    if error_type is None:
+        error_type = "none"
+    if error_type not in (known_error_types := {"none", "variance", "poisson_unweighted", "poisson_weighted"}):
+        raise ValueError(f"error_type must be one of {known_error_types}, not {error_type}")
 
     if kwargs.get("color", "") is None:
         # when color is set to None, remove it such that matplotlib automatically chooses a color
@@ -362,13 +398,17 @@ def draw_profile(
         "histtype": "step",
     }
     defaults.update(kwargs)
-    if "yerr" not in defaults:
+
+    if error_type == "none":
+        defaults.pop("yerr", None)
+    elif defaults.get("yerr") is None:
         if h.storage_type.accumulator is not hist.accumulators.WeightedSum:
             raise TypeError(
-                "Error bars calculation only implemented for histograms with storage type WeightedSum "
-                "either change the Histogram storage_type or set yerr manually",
+                "error bar calculation only implemented for histograms with storage type WeightedSum either change the "
+                "histogram storage_type or set yerr manually",
             )
         defaults["yerr"] = calculate_stat_error(h, error_type)
+
     h.plot1d(**defaults)
 
 
@@ -376,41 +416,82 @@ def draw_errorbars(
     ax: plt.Axes,
     h: hist.Hist,
     norm: float | Sequence | np.ndarray = 1.0,
-    error_type: str = "poisson_unweighted",
+    error_type: str | None = "poisson_unweighted",
     density: bool = False,
+    show_zero_bins: bool = True,
+    mark_out_of_range: bool = False,
     **kwargs,
 ) -> None:
     import hist
+    import matplotlib as mpl
 
-    assert error_type in {"variance", "poisson_unweighted", "poisson_weighted"}
+    if error_type is None:
+        error_type = "none"
+    if error_type not in (known_error_types := {"none", "variance", "poisson_unweighted", "poisson_weighted"}):
+        raise ValueError(f"error_type must be one of {known_error_types}, not {error_type}")
 
-    values = h.values() / norm
+    # get coordinates
+    x = np.array(h.axes[0].centers)
+    y = h.values() / norm
 
+    # filter non-finite values
+    filter_mask = np.isfinite(y)
+    if not show_zero_bins:
+        filter_mask &= y != 0
+    x = x[filter_mask]
+    y = y[filter_mask]
+
+    # handle error bars
+    yerr = kwargs.pop("yerr", None)
+    if error_type == "none":
+        yerr = None
+    elif yerr is None:
+        if h.storage_type.accumulator is not hist.accumulators.WeightedSum:
+            raise TypeError(
+                "error bar calculation only implemented for histograms with storage type WeightedSum either change the "
+                "histogram storage_type or set yerr manually",
+            )
+        yerr = calculate_stat_error(h, error_type, density=density)
+        # normalize yerr to the histogram = error propagation on standard deviation
+        yerr = abs(yerr / norm)
+        # filter values
+        yerr = yerr[:, filter_mask]
+        # replace inf with nan for any bin where norm = 0 and calculate_stat_error returns a non zero value
+        yerr[np.isnan(yerr)] = np.nan
+
+    # build all errorbar kwargs
     defaults = {
-        "x": h.axes[0].centers,
-        "y": values,
+        "x": x,
+        "y": y,
         "color": "k",
         "linestyle": "none",
         "marker": "o",
         "elinewidth": 1,
     }
+    if yerr is not None:
+        defaults["yerr"] = yerr
     defaults.update(kwargs)
 
-    if "yerr" not in defaults:
-        if h.storage_type.accumulator is not hist.accumulators.WeightedSum:
-            raise TypeError(
-                "Error bars calculation only implemented for histograms with storage type WeightedSum "
-                "either change the Histogram storage_type or set yerr manually",
-            )
-        yerr = calculate_stat_error(h, error_type, density=density)
-        # normalize yerr to the histogram = error propagation on standard deviation
-        yerr = abs(yerr / norm)
-        # replace inf with nan for any bin where norm = 0 and calculate_stat_error returns a non zero value
-        if np.any(np.isinf(yerr)):
-            yerr[np.isinf(yerr)] = np.nan
-        defaults["yerr"] = yerr
-
+    # draw
     ax.errorbar(**defaults)
+
+    # optionally add out-of-range markers
+    if mark_out_of_range:
+        y_min, y_max = ax.get_ylim()
+        y_mid = (y_min + y_max) / 2
+        # show markers when the y value is just outside the visible range
+        offset_scale = 1.02  # offset to make sure the full marker is out-of-range
+        mask_hi = y > (y_mid + offset_scale * (y_max - y_mid))
+        mask_lo = y < (y_mid - offset_scale * (y_mid - y_min))
+        # plot triangle-up/down markers for high/low values
+        marker_kwargs = {
+            "color": "#555555",
+            "s": (defaults.get("markersize", mpl.rcParams.get("lines.markersize", 6)) * 0.85) ** 2,
+            "zorder": 10,
+        }
+        offset_marker = 2 * (offset_scale - 1) * (y_max - y_min)
+        ax.scatter(x[mask_hi], [y_max - offset_marker] * mask_hi.sum(), marker="^", **marker_kwargs)
+        ax.scatter(x[mask_lo], [y_min + offset_marker] * mask_lo.sum(), marker="v", **marker_kwargs)
 
 
 def plot_all(
@@ -437,10 +518,12 @@ def plot_all(
     The *style_config* expects fields (all optional):
 
         - "gridspec_cfg": dict
+        - "subplots_cfg": dict
         - "ax_cfg": dict
         - "rax_cfg": dict
         - "legend_cfg": dict
         - "cms_label_cfg": dict
+        - "annotate_cfg": dict or list[dict]
 
     :param plot_config: Dictionary that defines which plot methods will be called with which key word arguments.
     :param style_config: Dictionary that defines arguments on how to style the overall plot.
@@ -479,6 +562,22 @@ def plot_all(
         fig, ax = plt.subplots(gridspec_kw=grid_spec, **subplots_cfg)
         axs = (ax,)
 
+    # prepare ratio plot
+    # (it usually has a fixed vertical range, so it can be cofigured before anything is plotted inside)
+    if not skip_ratio:
+        # hard-coded line at 1
+        rax.axhline(y=1.0, linestyle="dashed", color="gray")
+        # apply axis kwargs
+        rax_kwargs = {
+            "ylim": (0.72, 1.28),
+            "ylabel": "Ratio",
+            "xlabel": "Variable",
+            "yscale": "linear",
+            "xticklabelformat": {"style": "sci", "useMathText": True},
+        }
+        rax_kwargs.update(style_config.get("rax_cfg", {}))
+        apply_ax_kwargs(rax, rax_kwargs)
+
     # invoke all plots methods
     plot_methods = {
         func.__name__: func
@@ -511,6 +610,9 @@ def plot_all(
         "ylabel": "Counts",
         "xlabel": "variable",
         "yscale": "linear",
+        "xticklabelformat": {"style": "sci", "useMathText": True},
+        "yticklabelformat": {"style": "sci", "useMathText": True},
+        "yoffsettext": {"horizontalalignment": "right", "fontsize": 18},
     }
 
     # some default ylim settings based on yscale
@@ -526,24 +628,9 @@ def plot_all(
     # apply axis kwargs
     apply_ax_kwargs(ax, ax_kwargs)
 
-    # ratio plot
-    if not skip_ratio:
-        # hard-coded line at 1
-        rax.axhline(y=1.0, linestyle="dashed", color="gray")
-        rax_kwargs = {
-            "ylim": (0.72, 1.28),
-            "ylabel": "Ratio",
-            "xlabel": "Variable",
-            "yscale": "linear",
-        }
-        rax_kwargs.update(style_config.get("rax_cfg", {}))
-
-        # apply axis kwargs
-        apply_ax_kwargs(rax, rax_kwargs)
-
-        # remove x-label from main axis
-        if "xlabel" in rax_kwargs:
-            ax.set_xlabel("")
+    # remove x label when a ratio plot is shown
+    if not skip_ratio and "xlabel" in rax_kwargs:
+        ax.set_xlabel("")
 
     # label alignment
     fig.align_labels()
@@ -569,10 +656,13 @@ def plot_all(
         if callable(entries_per_col):
             entries_per_col = entries_per_col(ax, handles, labels, n_cols)
         if entries_per_col and n_cols > 1:
-            if isinstance(entries_per_col, (list, tuple)):
-                assert len(entries_per_col) == n_cols
-            else:
+            if not isinstance(entries_per_col, (list, tuple)):
                 entries_per_col = [entries_per_col] * n_cols
+            elif len(entries_per_col) != n_cols:
+                raise ValueError(
+                    f"when provided as a sequence, entries_per_col must have the same length as ncols ({n_cols}), but "
+                    f"got {len(entries_per_col)}",
+                )
             # fill handles and labels with empty entries
             max_entries = max(entries_per_col)
             empty_handle = ax.plot([], label="", linestyle="None")[0]
@@ -600,22 +690,23 @@ def plot_all(
         # make legend using ordered handles/labels
         ax.legend(handles, labels, **legend_kwargs)
 
-    # custom annotation
-    log_x = style_config.get("ax_cfg", {}).get("xscale", "linear") == "log"
-    annotate_kwargs = {
-        "text": "",
-        "xy": (
-            get_position(*ax.get_xlim(), factor=0.05, logscale=log_x),
-            get_position(*ax.get_ylim(), factor=0.95, logscale=log_y),
-        ),
-        "xycoords": "data",
-        "color": "black",
-        "fontsize": 22,
-        "horizontalalignment": "left",
-        "verticalalignment": "top",
-    }
-    annotate_kwargs.update(style_config.get("annotate_cfg", {}))
-    ax.annotate(**annotate_kwargs)
+    # custom annotations
+    if (annotate_config := style_config.get("annotate_cfg", None)):
+        log_x = style_config.get("ax_cfg", {}).get("xscale", "linear") == "log"
+        annotate_kwargs = {
+            "text": "",
+            "xy": (
+                get_position(*ax.get_xlim(), factor=0.05, logscale=log_x),
+                get_position(*ax.get_ylim(), factor=0.95, logscale=log_y),
+            ),
+            "xycoords": "data",
+            "color": "black",
+            "fontsize": 22,
+            "horizontalalignment": "left",
+            "verticalalignment": "top",
+        }
+        for _annotate_cfg in law.util.make_list(annotate_config):
+            ax.annotate(**{**annotate_kwargs, **_annotate_cfg})
 
     # cms label
     if cms_label != "skip":

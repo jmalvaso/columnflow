@@ -19,8 +19,8 @@ import order as od
 import scinum as sn
 
 from columnflow.util import maybe_import, try_int, try_complex, safe_div, UNSET
-from columnflow.hist_util import copy_axis, sum_hists
-from columnflow.types import TYPE_CHECKING, Iterable, Any, Callable, Sequence, Hashable
+from columnflow.hist_util import copy_axis, sum_hists, ensure_bin_exists, insert_axis_values
+from columnflow.types import TYPE_CHECKING, Iterable, Any, Callable, Sequence, Hashable, Literal
 
 np = maybe_import("numpy")
 if TYPE_CHECKING:
@@ -225,20 +225,23 @@ def apply_process_scaling(hists: dict[Hashable, hist.Hist]) -> dict[Hashable, hi
             # compute the scale factor and round
             h_no_shift = remove_residual_axis_single(h, "shift", select_value="nominal")
             scale_factor = round_dynamic(safe_div(get_stack_integral(), h_no_shift.sum().value)) or 1
-        if try_int(scale_factor):
-            scale_factor = int(scale_factor)
+            if scale_factor == 1:
+                logger.warning(
+                    f"requested scaling histogram for process '{proc_inst.name}' to stack, but compute scale factor is "
+                    "1, so scaling is omitted",
+                )
+        if isinstance(scale_factor, (int, float)) and scale_factor != 1:
             hists[proc_inst] = h * scale_factor
             scale_factor_str = (
                 str(scale_factor)
-                if scale_factor < 1e5
-                else re.sub(r"e(\+?)(-?)(0*)", r"e\2", f"{scale_factor:.1e}")
+                if scale_factor < 1e5 else
+                re.sub(r"e(\+?)(-?)(0*)", r"e\2", f"{scale_factor:.1e}")
             )
-            if scale_factor != 1:
-                proc_inst.label = apply_label_placeholders(
-                    proc_inst.label,
-                    apply="SCALE",
-                    scale=scale_factor_str,
-                )
+            proc_inst.label = apply_label_placeholders(
+                proc_inst.label,
+                apply="SCALE",
+                scale=scale_factor_str,
+            )
 
         # remove remaining scale placeholders
         proc_inst.label = remove_label_placeholders(proc_inst.label, drop="SCALE")
@@ -320,7 +323,10 @@ def remove_negative_contributions(hists: dict[Hashable, hist.Hist]) -> dict[Hash
     _hists = hists.copy()
     for proc_inst, h in hists.items():
         h = h.copy()
-        h.view().value[h.view().value < 0] = 0
+        view = h.view(flow=True)
+        neg_mask = view.value < 0
+        view.value[neg_mask] = 0.0
+        view.variance[neg_mask] = 0.0
         _hists[proc_inst] = h
     return _hists
 
@@ -440,10 +446,12 @@ def remove_residual_axis(
         for key, h in hists.items()
     }
 
+
 def prepare_style_config(
+    *,
     config_inst: od.Config,
-    category_inst: od.Category,
     variable_inst: od.Variable,
+    category_inst: od.Category | None = None,
     density: bool | None = False,
     shape_norm: bool | None = False,
     yscale: str | None = "",
@@ -460,9 +468,6 @@ def prepare_style_config(
         variable_inst.x("x_min", variable_inst.x_min),
         variable_inst.x("x_max", variable_inst.x_max),
     )
-
-    # build the label from category and optional variable selection labels
-    cat_label = join_labels(category_inst.label, variable_inst.x("selection_label", None))
 
     # unit format on axes (could be configurable)
     unit_format = "{title} [{unit}]"
@@ -495,12 +500,16 @@ def prepare_style_config(
             "xrotation": variable_inst.x("x_label_rotation", None),
         },
         "legend_cfg": {},
-        "annotate_cfg": {"text": cat_label or ""},
         "cms_label_cfg": {
             "lumi": f"{0.001 * config_inst.x.luminosity.get('nominal'):.1f}",  # /pb -> /fb
             "com": config_inst.campaign.ecm,
         },
     }
+
+    # build the label from category and optional variable selection labels
+    if category_inst:
+        cat_label = join_labels(category_inst.label, variable_inst.x("selection_label", None))
+        style_config["annotate_cfg"] = {"text": cat_label or ""}
 
     # disable minor ticks based on variable_inst
     axis_type = variable_inst.x("axis_type", "variable")
@@ -516,10 +525,15 @@ def prepare_style_config(
 
 def prepare_stack_plot_config(
     hists: OrderedDict,
-    shape_norm: bool | None = False,
-    hide_stat_errors: bool | None = None,
-    draw_total_unc: bool | None = None,
     shift_insts: Sequence[od.Shift] | None = None,
+    shape_norm: bool | None = False,
+    hide_stat_errors: bool = False,
+    merge_stat_errors: bool = False,
+    show_syst_rate_change: bool = False,
+    ratio_mark_out_of_range: bool = True,
+    stat_error_label: str = "MC stat. unc.",
+    syst_error_label: str = "MC syst. unc.",
+    combined_error_label: str = "MC syst. + stat. unc.",
     density: bool = False,
     **kwargs,
 ) -> OrderedDict:
@@ -527,107 +541,8 @@ def prepare_stack_plot_config(
     Prepares a plot config with one entry to create plots containing a stack of
     backgrounds with uncertainty bands, unstacked processes as lines and
     data entrys with errorbars.
-
-    Feature added:
-      - ensure QCD nominal is present in *all* up/down shift variations used for MC systematic bands,
-        by creating a QCD "syst hist" with a full shift axis and filling every shift slice with the
-        QCD nominal (value+variance), then appending it to mc_syst_hists (if needed).
-
-    Enable debug prints with:
-      kwargs["debug_qcd_nominal_in_systs"] = True
-    Disable the feature with:
-      kwargs["include_qcd_nominal_in_systs"] = False
     """
-    import numpy as np
-
-    include_qcd_nominal_in_systs = kwargs.get("include_qcd_nominal_in_systs", True)
-    debug_qcd_nominal_in_systs = kwargs.get("debug_qcd_nominal_in_systs", False)
-
-    def _fmt(a):
-        a = np.asarray(a)
-        return np.array2string(a, precision=6, separator=", ", threshold=30)
-
-    def storage_from(donor: hist.Hist):
-        for attr in ("_storage_type", "storage_type"):
-            if hasattr(donor, attr):
-                st = getattr(donor, attr)
-                try:
-                    st = st() if callable(st) else st
-                except TypeError:
-                    st = st
-                try:
-                    return st() if isinstance(st, type) else st
-                except Exception:
-                    return st
-        return hist.storage.Weight()
-
-    def book_like_with_shift_axis(donor: hist.Hist, shift_labels) -> hist.Hist:
-        axes = []
-        for ax in donor.axes:
-            if getattr(ax, "name", None) == "shift":
-                axes.append(hist.axis.StrCategory(list(shift_labels), name="shift", growth=True))
-            else:
-                axes.append(ax)
-        return hist.Hist(*axes, storage=storage_from(donor)).reset()
-
-    def ensure_qcd_nominal_in_syst_hists(
-        mc_syst_hists: list[hist.Hist],
-        qcd_hist: hist.Hist | None,
-        default_shift: str,
-        shift_insts: Sequence[od.Shift] | None,
-    ) -> list[hist.Hist]:
-        if qcd_hist is None:
-            return mc_syst_hists
-        if "shift" not in qcd_hist.axes.name:
-            return mc_syst_hists
-
-        # If QCD already has >1 shift entries and is already part of mc_syst_hists, do nothing.
-        # (i.e. assume QCD variations are already handled upstream)
-        try:
-            if qcd_hist.axes["shift"].size > 1 and any(h is qcd_hist for h in mc_syst_hists):
-                return mc_syst_hists
-        except Exception:
-            pass
-
-        # Determine the "target" shift labels used in syst band computation
-        if mc_syst_hists:
-            target_shift_labels = [str(x) for x in list(mc_syst_hists[0].axes["shift"])]
-        elif shift_insts is not None:
-            target_shift_labels = [s.name for s in shift_insts]
-        else:
-            target_shift_labels = [str(x) for x in list(qcd_hist.axes["shift"])]
-
-        if "nominal" not in target_shift_labels:
-            target_shift_labels.append("nominal")
-
-        # Select QCD nominal slice
-        qcd_shift_labels = [str(x) for x in list(qcd_hist.axes["shift"])]
-        qcd_nom_shift = "nominal" if "nominal" in qcd_shift_labels else default_shift
-
-        qcd_nom_h = remove_residual_axis_single(qcd_hist, "shift", select_value=qcd_nom_shift)
-        qcd_nom_val = qcd_nom_h.values()
-        qcd_nom_var = qcd_nom_h.view().variance
-
-        # Build a QCD syst hist with full shift axis and fill every shift slice with nominal
-        qcd_syst = book_like_with_shift_axis(qcd_hist, target_shift_labels)
-        arr = qcd_syst.view()
-
-        for sh in target_shift_labels:
-            i = qcd_syst.axes["shift"].index(sh)
-
-            if debug_qcd_nominal_in_systs and (sh.endswith("_up") or sh.endswith("_down")):
-                print(f"[QCD syst fill] {sh} BEFORE val={_fmt(arr[i].value)} var={_fmt(arr[i].variance)}")
-
-            arr[i].value = qcd_nom_val
-            arr[i].variance = qcd_nom_var
-
-            if debug_qcd_nominal_in_systs and (sh.endswith("_up") or sh.endswith("_down")):
-                print(f"[QCD syst fill] {sh} AFTER  val={_fmt(arr[i].value)} var={_fmt(arr[i].variance)}")
-
-        qcd_syst[...] = arr
-
-        # Append once so that systematic-summed MC variations include QCD nominal exactly once
-        return [*mc_syst_hists, qcd_syst]
+    import hist
 
     # separate histograms into stack, lines and data hists
     mc_hists, mc_colors, mc_edgecolors, mc_labels = [], [], [], []
@@ -637,13 +552,6 @@ def prepare_stack_plot_config(
     data_label = None
 
     default_shift = shift_insts[0].name if len(shift_insts) == 1 else "nominal"
-
-    # try to identify the QCD process instance
-    qcd_hist_full = None
-    try:
-        from cmsdb.processes.qcd import qcd as qcd_proc
-    except Exception:
-        qcd_proc = None
 
     for process_inst, h in hists.items():
         # if given, per-process setting overrides task parameter
@@ -663,23 +571,8 @@ def prepare_stack_plot_config(
             mc_colors.append(process_inst.color1)
             mc_edgecolors.append(process_inst.color2)
             mc_labels.append(process_inst.label)
-
-            # keep original (with shift axis) for syst bands
             if "shift" in h.axes.name and h.axes["shift"].size > 1:
                 mc_syst_hists.append(h)
-
-            # capture QCD hist (original, with shift axis) if available
-            if qcd_proc is not None and process_inst == qcd_proc:
-                qcd_hist_full = h
-
-    # ensure QCD nominal is present for all systematic variations (for uncertainty bands)
-    if include_qcd_nominal_in_systs:
-        mc_syst_hists = ensure_qcd_nominal_in_syst_hists(
-            mc_syst_hists=mc_syst_hists,
-            qcd_hist=qcd_hist_full,
-            default_shift=default_shift,
-            shift_insts=shift_insts,
-        )
 
     h_data, h_mc, h_mc_stack = None, None, None
     if data_hists:
@@ -720,6 +613,10 @@ def prepare_stack_plot_config(
                 "color": line_colors[i],
                 "error_type": "variance",
             },
+            # "ratio_kwargs": {
+            #     "norm": h.values(),
+            #     "color": line_colors[i],
+            # },
         }
 
         # suppress error bars by overriding `yerr`
@@ -728,60 +625,68 @@ def prepare_stack_plot_config(
                 if key in plot_cfg:
                     plot_cfg[key]["yerr"] = False
 
-    # --- draw uncertainties for stack ---
-    if h_mc_stack is not None:
-        mc_norm = sum(h_mc.values()) if shape_norm else 1
-        if draw_total_unc:
-            print("drawing total uncertainty band")
-            if mc_syst_hists:
-                plot_config["mc_total_unc"] = {
-                    "method": "draw_total_error_bands",
-                    "hist": h_mc,
-                    "kwargs": {
-                        "syst_hists": mc_syst_hists,
-                        "shift_insts": shift_insts,
-                        "norm": mc_norm,
-                        "label": "MC total unc.",
-                    },
-                    "ratio_kwargs": {
-                        "syst_hists": mc_syst_hists,
-                        "shift_insts": shift_insts,
-                        "norm": h_mc.values(),
-                    },
-                }
-            else:
-                if not hide_stat_errors:
-                    plot_config["mc_stat_unc"] = {
-                        "method": "draw_stat_error_bands",
-                        "hist": h_mc,
-                        "kwargs": {"norm": mc_norm, "label": "MC stat. unc."},
-                        "ratio_kwargs": {"norm": h_mc.values()},
-                    }
-        else:
-            if not hide_stat_errors:
-                plot_config["mc_stat_unc"] = {
-                    "method": "draw_stat_error_bands",
-                    "hist": h_mc,
-                    "kwargs": {"norm": mc_norm, "label": "MC stat. unc."},
-                    "ratio_kwargs": {"norm": h_mc.values()},
-                }
+    # draw statistical error for stack
+    draw_stat_errors = bool(not hide_stat_errors and h_mc_stack is not None)
+    if draw_stat_errors and not merge_stat_errors:
+        mc_norm = shape_norm_func(h_mc, shape_norm)
+        plot_config["mc_stat_unc"] = {
+            "method": "draw_stat_error_bands",
+            "hist": h_mc,
+            "kwargs": {
+                "norm": mc_norm,
+                "label": stat_error_label,
+                "hatch_style": "black",
+            },
+            "ratio_kwargs": {
+                "norm": h_mc.values(),
+                "hatch_style": "black",
+            },
+        }
 
-            if mc_syst_hists:
-                plot_config["mc_syst_unc"] = {
-                    "method": "draw_syst_error_bands",
-                    "hist": h_mc,
-                    "kwargs": {
-                        "syst_hists": mc_syst_hists,
-                        "shift_insts": shift_insts,
-                        "norm": mc_norm,
-                        "label": "MC syst. unc.",
-                    },
-                    "ratio_kwargs": {
-                        "syst_hists": mc_syst_hists,
-                        "shift_insts": shift_insts,
-                        "norm": h_mc.values(),
-                    },
-                }
+    # draw systematic error for stack
+    draw_syst_errors = bool(mc_syst_hists and h_mc_stack is not None)
+    if draw_syst_errors:
+        mc_norm = shape_norm_func(h_mc, shape_norm)
+        # when merging stat and syst errors, add a fake shift inst and extend shift axes of histograms to include it
+        _shift_insts = shift_insts
+        _mc_syst_hists = mc_syst_hists
+        label = syst_error_label
+        hatch_style = "green_backwards"
+        if merge_stat_errors:
+            _shift_insts = [
+                *shift_insts,
+                od.Shift(name="mc_stat_up", id=100000, type="shape"),
+                od.Shift(name="mc_stat_down", id=100001, type="shape"),
+            ]
+            _mc_syst_hists = []
+            for h in mc_syst_hists:
+                h = ensure_bin_exists(h, "shift", ["mc_stat_up", "mc_stat_down"])  # always creates a copy
+                nom_view = h[{"shift": hist.loc("nominal")}].view()
+                stat_err = nom_view.variance**0.5
+                insert_axis_values(h, "shift", "mc_stat_up", nom_view.value + stat_err)
+                insert_axis_values(h, "shift", "mc_stat_down", nom_view.value - stat_err)
+                _mc_syst_hists.append(h)
+            label = combined_error_label
+            hatch_style = "black"
+        # add plot config
+        plot_config["mc_syst_unc"] = {
+            "method": "draw_syst_error_bands",
+            "hist": h_mc,
+            "kwargs": {
+                "syst_hists": _mc_syst_hists,
+                "shift_insts": _shift_insts,
+                "norm": mc_norm,
+                "label": label,
+                "hatch_style": hatch_style,
+                "show_rate_change": show_syst_rate_change,
+            },
+            "ratio_kwargs": {
+                "syst_hists": _mc_syst_hists,
+                "shift_insts": _shift_insts,
+                "norm": h_mc.values(),
+                "hatch_style": hatch_style,
+            },
+        }
 
     # draw data
     if data_hists:
@@ -802,8 +707,11 @@ def prepare_stack_plot_config(
                 "norm": h_mc.values() * data_norm / mc_norm,
                 "error_type": "poisson_unweighted",
                 "density": density,
+                "show_zero_bins": False,
+                "mark_out_of_range": ratio_mark_out_of_range,
             }
 
+        # suppress error bars by overriding `yerr`
         if any(data_hide_stat_errors):
             for key in ("kwargs", "ratio_kwargs"):
                 if key in plot_cfg:
@@ -811,6 +719,29 @@ def prepare_stack_plot_config(
 
     return plot_config
 
+
+HatchStyles = Literal["black", "green", "black_backwards", "green_backwards"]
+
+
+def get_hatch_kwargs(style: HatchStyles) -> dict[str, Any]:
+    kwargs = {
+        "linewidth": 0,
+        "color": "none",
+        "alpha": 1.0,
+    }
+
+    if style == "black":
+        kwargs.update({"hatch": "///", "edgecolor": "black"})
+    elif style == "black_backwards":
+        kwargs.update({"hatch": "\\\\\\", "edgecolor": "black"})
+    elif style == "green":
+        kwargs.update({"hatch": "///", "edgecolor": "#30c300"})
+    elif style == "green_backwards":
+        kwargs.update({"hatch": "\\\\\\", "edgecolor": "#30c300"})
+    else:
+        raise ValueError(f"unknown hatch style '{style}'")
+
+    return kwargs
 
 
 def split_ax_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -821,7 +752,8 @@ def split_ax_kwargs(kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
     set_kwargs, other_kwargs = {}, {}
     other_keys = {
         "xmajorticks", "xminorticks", "xmajorticklabels", "xminorticklabels", "xloc", "xrotation",
-        "ymajorticks", "yminorticks", "yloc", "yrotation",
+        "ymajorticks", "yminorticks", "yloc", "yrotation", "xticklabelformat", "yticklabelformat",
+        "xoffsettext", "yoffsettext",
     }
     for key, value in kwargs.items():
         (other_kwargs if key in other_keys else set_kwargs)[key] = value
@@ -860,6 +792,24 @@ def apply_ax_kwargs(ax: plt.Axes, kwargs: dict[str, Any]) -> None:
         ax.tick_params(axis="x", labelrotation=other_kwargs.get("xrotation"))
     if other_kwargs.get("yrotation") is not None:
         ax.tick_params(axis="y", labelrotation=other_kwargs.get("yrotation"))
+    if other_kwargs.get("xticklabelformat") is not None:
+        _kwargs = other_kwargs["xticklabelformat"].copy()
+        if not callable(getattr(ax.xaxis.major.formatter, "set_scientific", None)):
+            if _kwargs.get("style") == "sci":
+                _kwargs.pop("style")
+                _kwargs.pop("useMathText", None)
+        ax.ticklabel_format(axis="x", **_kwargs)
+    if other_kwargs.get("yticklabelformat") is not None:
+        _kwargs = other_kwargs["yticklabelformat"].copy()
+        if not callable(getattr(ax.yaxis.major.formatter, "set_scientific", None)):
+            if _kwargs.get("style") == "sci":
+                _kwargs.pop("style")
+                _kwargs.pop("useMathText", None)
+        ax.ticklabel_format(axis="y", **_kwargs)
+    if other_kwargs.get("xoffsettext") is not None:
+        ax.xaxis.get_offset_text().set(**other_kwargs["xoffsettext"])
+    if other_kwargs.get("yoffsettext") is not None:
+        ax.yaxis.get_offset_text().set(**other_kwargs["yoffsettext"])
 
 
 def get_position(minimum: float, maximum: float, factor: float = 1.4, logscale: bool = False) -> float:
@@ -1109,13 +1059,15 @@ def rebin_equal_width(
     import hist
 
     # get the variable axis from the first histogram
-    assert hists
+    if not hists:
+        raise ValueError("no histograms provided")
     for var_index, var_axis in enumerate(list(hists.values())[0].axes):
         if var_axis.name == axis_name:
             break
     else:
         raise ValueError(f"axis '{axis_name}' not found in histograms")
-    assert isinstance(var_axis, (hist.axis.Variable, hist.axis.Regular))
+    if not isinstance(var_axis, (hist.axis.Variable, hist.axis.Regular)):
+        raise TypeError(f"axis '{axis_name}' is not a Variable or Regular axis, but {type(var_axis)}")
     orig_edges = var_axis.edges
 
     # prepare arguments for the axis copy

@@ -94,26 +94,20 @@ class CreateHistograms(_CreateHistograms):
     def workflow_requires(self):
         reqs = super().workflow_requires()
 
-        if not self.pilot:
-            if self.producer_insts:
-                reqs["producers"] = [
-                    self.reqs.ProduceColumns.req(
-                        self,
-                        producer=producer_inst.cls_name,
-                        producer_inst=producer_inst,
-                    )
-                    for producer_inst in self.producer_insts
-                    if producer_inst.produced_columns
-                ]
-            if self.ml_model_insts:
-                reqs["ml"] = [
-                    self.reqs.MLEvaluation.req(self, ml_model=ml_model_inst.cls_name)
-                    for ml_model_inst in self.ml_model_insts
-                ]
-        elif self.producer_insts:
-            # pass-through pilot workflow requirements of upstream task
-            t = self.reqs.ProduceColumns.req(self)
-            law.util.merge_dicts(reqs, t.workflow_requires(), inplace=True)
+        # depending on pilot flag, add upstream workflows or pass-through their own requirements only
+        reqs["producers"] = list(map(self.pilot_workflow_requires, (
+            self.reqs.ProduceColumns.req(
+                self,
+                producer=producer_inst.cls_name,
+                producer_inst=producer_inst,
+            )
+            for producer_inst in self.producer_insts
+            if producer_inst.produced_columns
+        )))
+        reqs["ml"] = list(map(self.pilot_workflow_requires, (
+            self.reqs.MLEvaluation.req(self, ml_model=ml_model_inst.cls_name)
+            for ml_model_inst in self.ml_model_insts
+        )))
 
         # add hist producer dependent requirements
         reqs["hist_producer"] = law.util.make_unique(law.util.flatten(self.hist_producer_inst.run_requires(task=self)))
@@ -143,9 +137,7 @@ class CreateHistograms(_CreateHistograms):
             ]
 
         # add hist_producer dependent requirements
-        reqs["hist_producer"] = law.util.make_unique(law.util.flatten(
-            self.hist_producer_inst.run_requires(task=self),
-        ))
+        reqs["hist_producer"] = law.util.make_unique(law.util.flatten(self.hist_producer_inst.run_requires(task=self)))
 
         # require merged events
         reqs["events"] = self.reqs.ProvideReducedEvents.req(self)
@@ -213,7 +205,7 @@ class CreateHistograms(_CreateHistograms):
                 {variable_inst.expression}
                 if isinstance(variable_inst.expression, str)
                 else set()
-            ) | set(
+            ) | law.util.make_set(
                 # read requested input columns if defined
                 variable_inst.x("inputs", []),
             ))
@@ -282,7 +274,10 @@ class CreateHistograms(_CreateHistograms):
 
                     if var_key not in histograms:
                         # create the histogram in the first chunk
-                        histograms[var_key] = self.hist_producer_inst.run_create_hist(variable_insts, task=self)
+                        histograms[var_key] = self.hist_producer_inst.run_create_hist(
+                            variables=variable_insts,
+                            task=self,
+                        )
 
                     # mask events and weights when selection expressions are found
                     masked_events = events
@@ -319,17 +314,20 @@ class CreateHistograms(_CreateHistograms):
                         fill_data[variable_inst.name] = expr(masked_events)
 
                     # let the hist producer fill it
-                    self.hist_producer_inst.run_fill_hist(histograms[var_key], fill_data, task=self)
+                    self.hist_producer_inst.run_fill_hist(
+                        h=histograms[var_key],
+                        data=fill_data,
+                        variables=variable_insts,
+                        events=masked_events,
+                        task=self,
+                    )
 
         # post-process the histograms
         for var_key in self.variable_tuples.keys():
-            histograms[var_key] = self.hist_producer_inst.run_post_process_hist(histograms[var_key], task=self)
+            histograms[var_key] = self.hist_producer_inst.run_post_process_hist(h=histograms[var_key], task=self)
 
             # check the format after post-processing if no merged preprocessing will take place
-            if (
-                not self.hist_producer_inst.skip_compatibility_check and
-                not callable(self.hist_producer_inst.post_process_merged_hist_func)
-            ):
+            if self.hist_producer_inst.post_process_compatibility_check:
                 self.check_histogram_compatibility(histograms[var_key])
 
         # teardown the hist producer
@@ -388,6 +386,8 @@ class MergeHistograms(_MergeHistograms):
         CreateHistograms=CreateHistograms,
     )
 
+    invokes_hist_producer = True
+
     @classmethod
     def req_params(cls, inst: AnalysisTask, **kwargs) -> dict:
         _prefer_cli = law.util.make_set(kwargs.get("_prefer_cli", [])) | {"variables"}
@@ -414,14 +414,13 @@ class MergeHistograms(_MergeHistograms):
     def workflow_requires(self):
         reqs = super().workflow_requires()
 
-        if not self.pilot:
-            variables = self._get_variables()
-            if variables:
-                reqs["hists"] = self.reqs.CreateHistograms.req_different_branching(
-                    self,
-                    branch=-1,
-                    variables=tuple(variables),
-                )
+        variables = self._get_variables()
+        if variables:
+            reqs["hists"] = self.pilot_workflow_requires(self.reqs.CreateHistograms.req_different_branching(
+                self,
+                branch=-1,
+                variables=tuple(variables),
+            ))
 
         return reqs
 
@@ -452,6 +451,9 @@ class MergeHistograms(_MergeHistograms):
         inputs = self.input()["collection"]
         outputs = self.output()
 
+        # run the hist_producer setup
+        self._array_function_post_init()
+
         # load input histograms
         hists = [
             inp["hists"].load(formatter="pickle")
@@ -471,14 +473,17 @@ class MergeHistograms(_MergeHistograms):
             merged = sum_hists(variable_hists)
 
             # post-process the merged histogram
-            merged = self.hist_producer_inst.run_post_process_merged_hist(merged, task=self)
+            merged = self.hist_producer_inst.run_post_process_merged_hist(h=merged, task=self)
 
             # ensure the format is compatible
-            if not self.hist_producer_inst.skip_compatibility_check:
+            if self.hist_producer_inst.post_process_merged_compatibility_check:
                 CreateHistograms.check_histogram_compatibility(merged)
 
+            # do not overwrite permissions when the file was already existing
+            perm = 0 if outputs["hists"][variable_name].exists() else None
+
             # write the output
-            outputs["hists"][variable_name].dump(merged, formatter="pickle")
+            outputs["hists"][variable_name].dump(merged, perm=perm, formatter="pickle")
 
         # optionally remove inputs
         if self.remove_previous:
@@ -540,17 +545,20 @@ class MergeShiftedHistograms(_MergeShiftedHistograms):
     def workflow_requires(self):
         reqs = super().workflow_requires()
 
-        if not self.pilot:
-            # add nominal and both directions per shift source
-            for shift in expand_shift_sources(self.shift_sources):
-                reqs[shift] = self.reqs.MergeHistograms.req(self, shift=shift, _prefer_cli={"variables"})
+        # add nominal and both directions per shift source
+        for shift_name in expand_shift_sources(self.shift_sources):
+            reqs[shift_name] = self.pilot_workflow_requires(self.reqs.MergeHistograms.req(
+                self,
+                shift=shift_name,
+                _prefer_cli={"variables"},
+            ))
 
         return reqs
 
     def requires(self):
         return {
-            shift: self.reqs.MergeHistograms.req(self, shift=shift, _prefer_cli={"variables"})
-            for shift in expand_shift_sources(self.branch_data)
+            shift_name: self.reqs.MergeHistograms.req(self, shift=shift_name, _prefer_cli={"variables"})
+            for shift_name in expand_shift_sources(self.branch_data)
         }
 
     def store_parts(self) -> law.util.InsertableDict:

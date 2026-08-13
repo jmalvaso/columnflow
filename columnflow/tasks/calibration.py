@@ -71,9 +71,7 @@ class CalibrateEvents(_CalibrateEvents):
         reqs = {"lfns": self.reqs.GetDatasetLFNs.req(self)}
 
         # add calibrator dependent requirements
-        reqs["calibrator"] = law.util.make_unique(law.util.flatten(
-            self.calibrator_inst.run_requires(task=self),
-        ))
+        reqs["calibrator"] = law.util.make_unique(law.util.flatten(self.calibrator_inst.run_requires(task=self)))
 
         return reqs
 
@@ -129,24 +127,33 @@ class CalibrateEvents(_CalibrateEvents):
         write_columns = self.calibrator_inst.produced_columns
         route_filter = RouteFilter(keep=write_columns)
 
-        # let the lfn_task prepare the nano file (basically determine a good pfn)
-        [(lfn_index, input_file)] = lfn_task.iter_nano_files(self)
+        # let the lfn_task locate and prepare the nano file(s)
+        nano_input = [nano_target for _, nano_target in lfn_task.iter_nano_files(self)]
+        if len(nano_input) == 1:
+            nano_input = nano_input[0]
 
         # prepare inputs for localization
         with law.localize_file_targets(
-            [input_file, *reader_targets.values()],
+            [nano_input, *reader_targets.values()],
             mode="r",
         ) as inps:
             # iterate over chunks
             for (events, *cols), pos in self.iter_chunked_io(
-                [inp.abspath for inp in inps],
+                law.util.map_struct(law.target.file.get_path, inps),
                 source_type=["coffea_root"] + (len(inps) - 1) * [None],
+                open_options=self.get_open_options(inps, first_is_nano=True),
+                read_options=self.get_read_options(inps, first_is_nano=True),
                 read_columns=len(inps) * [read_columns],
+                filter_config=self.get_filter_configs(inps, first_is_nano=True),
                 chunk_size=self.calibrator_inst.get_min_chunk_size(),
             ):
+                # adjust if necessary
+                if callable(self.adjust_chunks):
+                    events, *cols = self.adjust_chunks([events, *cols])
+
                 # optional check for overlapping inputs
                 if self.check_overlapping_inputs:
-                    self.raise_if_overlapping([events] + list(cols))
+                    self.raise_if_overlapping([events, *cols])
 
                 # insert additional columns
                 events = update_ak_array(events, *cols)
@@ -162,8 +169,8 @@ class CalibrateEvents(_CalibrateEvents):
                     self.raise_if_not_finite(events)
 
                 # save as parquet via a thread in the same pool
-                chunk = tmp_dir.child(f"file_{lfn_index}_{pos.index}.parquet", type="f")
-                output_chunks[(lfn_index, pos.index)] = chunk
+                chunk = tmp_dir.child(f"file_{pos.index}.parquet", type="f")
+                output_chunks[pos.index] = chunk
                 self.chunked_io.queue(sorted_ak_to_parquet, (events, chunk.abspath))
 
         # teardown the calibrator

@@ -15,16 +15,18 @@ from columnflow import __version__ as cf_version
 from columnflow.inference import InferenceModel, ParameterType, ParameterTransformation, FlowStrategy
 from columnflow.hist_util import sum_hists
 from columnflow.util import DotDict, maybe_import, real_path, ensure_dir, safe_div, maybe_int
-from columnflow.types import TYPE_CHECKING, Sequence, Any, Union, Hashable
+from columnflow.types import TYPE_CHECKING, TypeAlias, Sequence, Any, Union, Hashable
+
+np = maybe_import("numpy")
 
 if TYPE_CHECKING:
     hist = maybe_import("hist")
 
-    # type aliases for nested histogram structs
-    ShiftHists = dict[Union[str, tuple[str, str]], hist.Hist]  # "nominal" or (param_name, "up|down") -> hists
-    ConfigHists = dict[str, ShiftHists]  # config name -> hists
-    ProcHists = dict[str, ConfigHists]  # process name -> hists
-    DatacardHists = dict[str, ProcHists]  # category name -> hists
+# type aliases for nested histogram structs
+ShiftHists: TypeAlias = dict[Union[str, tuple[str, str]], "hist.Hist"]  # "nominal" or (param_name, "up|down") -> hists
+ConfigHists: TypeAlias = dict[str, ShiftHists]  # config name -> hists
+ProcHists: TypeAlias = dict[str, ConfigHists]  # process name -> hists
+DatacardHists: TypeAlias = dict[str, ProcHists]  # category name -> hists
 
 
 logger = law.logger.get_logger(__name__)
@@ -68,6 +70,7 @@ class DatacardWriter(object):
             Configurable via *asymmetrize_if_large_threshold*.
         - :py:attr:`ParameterTransformation.normalize`: Normalizes shape variations such that their integrals match that
             of the nominal shape.
+        - :py:attr:`ParameterTransformation.centralize`: # TODO: not yet implemented
         - :py:attr:`ParameterTransformation.envelope`: Takes the bin-wise maximum in each direction of the up and down
             variations of shape-type parameters and constructs new shapes.
         - :py:attr:`ParameterTransformation.envelope_if_one_sided`: Same as above, but only in bins where up and down
@@ -93,28 +96,6 @@ class DatacardWriter(object):
     # minimum separator between columns
     col_sep = "  "
 
-    # specific sets of transformations
-    first_index_trafos = {
-        ParameterTransformation.effect_from_rate,
-        ParameterTransformation.effect_from_shape,
-        ParameterTransformation.effect_from_shape_if_flat,
-    }
-    shape_only_trafos = {
-        ParameterTransformation.effect_from_rate,
-        ParameterTransformation.normalize,
-        ParameterTransformation.envelope,
-        ParameterTransformation.envelope_if_one_sided,
-        ParameterTransformation.envelope_enforce_two_sided,
-    }
-    rate_only_trafos = {
-        ParameterTransformation.effect_from_shape,
-        ParameterTransformation.effect_from_shape_if_flat,
-        ParameterTransformation.asymmetrize,
-        ParameterTransformation.asymmetrize_if_large,
-        ParameterTransformation.flip_smaller_if_one_sided,
-        ParameterTransformation.flip_larger_if_one_sided,
-    }
-
     @classmethod
     def validate_model(cls, inference_model_inst: InferenceModel, silent: bool = False) -> bool:
         # perform parameter checks one after another, collect errors along the way
@@ -123,16 +104,16 @@ class DatacardWriter(object):
             # check the transformations
             _errors: list[str] = []
             for i, trafo in enumerate(param_obj.transformations):
-                if i != 0 and trafo in cls.first_index_trafos:
+                if i != 0 and trafo.requires_first_index:
                     _errors.append(
                         f"parameter transformation '{trafo}' must be the first one to apply, but found at index {i}",
                     )
-                if not param_obj.type.is_shape and trafo in cls.shape_only_trafos:
+                if not param_obj.type.is_shape and trafo.affects_shape_only:
                     _errors.append(
                         f"parameter transformation '{trafo}' only applies to shape-type parameters, but found type "
                         f"'{param_obj.type}'",
                     )
-                if not param_obj.type.is_rate and trafo in cls.rate_only_trafos:
+                if not param_obj.type.is_rate and trafo.affects_rate_only:
                     _errors.append(
                         f"parameter transformation '{trafo}' only applies to rate-type parameters, but found type "
                         f"'{param_obj.type}'",
@@ -247,7 +228,7 @@ class DatacardWriter(object):
         cat_objects = [self.inference_model_inst.get_category(cat_name) for cat_name in rates]
 
         # prepare blocks and lines to write
-        blocks = DotDict()
+        blocks: DotDict[str, list] = DotDict()
         separators = set()
         empty_lines = set()
 
@@ -317,8 +298,10 @@ class DatacardWriter(object):
             types = set()
             effects = []
             for cat_name, proc_name in flat_rates:
+                cat_obj = self.inference_model_inst.get_category(category=cat_name)
+                proc_obj = self.inference_model_inst.get_process(category=cat_name, process=proc_name)
                 param_obj = self.inference_model_inst.get_parameter(
-                    param_name,
+                    parameter=param_name,
                     category=cat_name,
                     process=proc_name,
                     silent=True,
@@ -433,7 +416,7 @@ class DatacardWriter(object):
                             effect = 1.0
 
                 # custom hook to modify the effect
-                effect = self.modify_parameter_effect(cat_name, proc_name, param_obj, effect)
+                effect = self.modify_parameter_effect(cat_obj, proc_obj, param_obj, effect)
 
                 # encode the effect
                 if isinstance(effect, (int, float)):
@@ -464,7 +447,7 @@ class DatacardWriter(object):
                         type_str = "shape"
                 elif types == {ParameterType.rate_gauss, ParameterType.shape}:
                     # when mixing lnN and shape effects, combine expects the "shape?" type and makes the actual decision
-                    # dependend on the presence of shape variations in the accompaying shape files, see
+                    # dependent on the presence of shape variations in the accompanying shape files, see
                     # https://cms-analysis.github.io/HiggsAnalysis-CombinedLimit/v10.2.X/part2/settinguptheanalysis/?h=shape%3F#template-shape-uncertainties # noqa
                     type_str = "shape?"
                 if not type_str:
@@ -539,6 +522,9 @@ class DatacardWriter(object):
             blocks.groups = self.align_lines(list(blocks.groups), end=3)
         if blocks.mc_stats:
             blocks.mc_stats = self.align_lines(list(blocks.mc_stats))
+
+        # allow modification before writing via hook
+        blocks, separators, empty_lines = self.modify_before_write(blocks, separators, empty_lines)
 
         # write the blocks
         with open(datacard_path, "w") as f:
@@ -615,17 +601,18 @@ class DatacardWriter(object):
 
             # warn in case of flow content
             if cat_obj.flow_strategy in {FlowStrategy.warn, FlowStrategy.move}:
+                move_msg = "; will be moved to first/last bin" if cat_obj.flow_strategy == FlowStrategy.move else ""
                 if underflow[0]:
                     logger.warning_once(
                         f"underflow_warn_{self.inference_model_inst.cls_name}_{cat_obj.name}_{name}",
                         f"underflow content detected in category '{cat_obj.name}' for histogram "
-                        f"'{name}' ({underflow[0] / view.value.sum() * 100:.1f}% of integral)",
+                        f"'{name}' ({underflow[0] / view.value.sum() * 100:.1f}% of integral){move_msg}",
                     )
                 if overflow[0]:
                     logger.warning_once(
                         f"overflow_warn_{self.inference_model_inst.cls_name}_{cat_obj.name}_{name}",
                         f"overflow content detected in category '{cat_obj.name}' for histogram "
-                        f"'{name}' ({overflow[0] / view.value.sum() * 100:.1f}% of integral)",
+                        f"'{name}' ({overflow[0] / view.value.sum() * 100:.1f}% of integral){move_msg}",
                     )
 
             # stop here in case of warn-only
@@ -666,7 +653,8 @@ class DatacardWriter(object):
             _effects = effects[cat_name] = OrderedDict()
             for proc_name, config_hists in proc_hists.items():
                 # skip if process is not known to category
-                if not self.inference_model_inst.has_process(process=proc_name, category=cat_name):
+                proc_obj = self.inference_model_inst.get_process(process=proc_name, category=cat_name, silent=True)
+                if not proc_obj:
                     continue
 
                 # defer the handling of data to the end
@@ -681,7 +669,7 @@ class DatacardWriter(object):
                 if not hists:
                     continue
 
-                # helper to sum over them for a given shift key and an optional fallback
+                # helper to sum over histograms for a given shift key and an optional fallback
                 def get_hist_sum(key: Hashable, fallback_key: Hashable | None = None) -> hist.Hist:
                     def get(hd: dict[Hashable, hist.Hist]) -> hist.Hist:
                         if key in hd:
@@ -692,6 +680,14 @@ class DatacardWriter(object):
                             f"'{key}' shape for process '{proc_name}' in category '{cat_name}' misconfigured: {hd}",
                         )
                     return sum_hists(map(get, hists))
+
+                # optionally skip the process under specific conditions
+                if (skip_reason := self.check_skip_process(cat_obj, proc_obj, get_hist_sum("nominal"))):
+                    skip_msg = f"skipping process '{proc_name}' in category '{cat_name}'"
+                    if not isinstance(skip_reason, bool):
+                        skip_msg += f", reason: {skip_reason}"
+                    skip_msg = logger.info(skip_msg)
+                    continue
 
                 # helper to extract sum of hists, apply scale, handle flow and fill empty bins
                 def load(
@@ -706,7 +702,6 @@ class DatacardWriter(object):
                     return h
 
                 # get the process scale (usually 1)
-                proc_obj = self.inference_model_inst.get_process(proc_name, category=cat_name)
                 scale = proc_obj.scale
 
                 # nominal shape
@@ -752,14 +747,14 @@ class DatacardWriter(object):
                             h_up = h_nom.copy() * f_up
                         else:
                             # just extract the shapes from the inputs
-                            h_down = load(down_name, (param_obj.name, "down"), "nominal", scale=scale)
-                            h_up = load(up_name, (param_obj.name, "up"), "nominal", scale=scale)
+                            h_down = load(down_name, (param_obj.name, "down"), fallback_key="nominal", scale=scale)
+                            h_up = load(up_name, (param_obj.name, "up"), fallback_key="nominal", scale=scale)
 
                     elif param_obj.type.is_rate:
                         if param_obj.transformations.any_from_shape:
                             # just extract the shapes
-                            h_down = load(down_name, (param_obj.name, "down"), "nominal", scale=scale)
-                            h_up = load(up_name, (param_obj.name, "up"), "nominal", scale=scale)
+                            h_down = load(down_name, (param_obj.name, "down"), fallback_key="nominal", scale=scale)
+                            h_up = load(up_name, (param_obj.name, "up"), fallback_key="nominal", scale=scale)
 
                             # in case the transformation is effect_from_shape_if_flat, and any of the two variations
                             # do not qualify as "flat", convert the parameter to shape-type and drop all transformations
@@ -767,19 +762,20 @@ class DatacardWriter(object):
                             if param_obj.transformations[0] == ParameterTransformation.effect_from_shape_if_flat:
                                 # check if flatness criteria are met
                                 for h in [h_down, h_up]:
+                                    # !!! TODO: bug! the relative difference should be flat, not the actual shape
                                     values = h.view().value
                                     mean, std = values.mean(), values.std()
-                                    rel_deviation = safe_div(std, mean)
                                     max_rel_outlier = safe_div(max(abs(values - mean)), mean)
+                                    rel_deviation = safe_div(std, mean)
                                     is_flat = (
-                                        rel_deviation <= self.effect_from_shape_if_flat_max_deviation and
-                                        max_rel_outlier <= self.effect_from_shape_if_flat_max_outlier
+                                        max_rel_outlier <= self.effect_from_shape_if_flat_max_outlier and
+                                        rel_deviation <= self.effect_from_shape_if_flat_max_deviation
                                     )
                                     if not is_flat:
                                         param_obj.type = ParameterType.shape
                                         param_obj.transformations = type(param_obj.transformations)(
                                             trafo for trafo in param_obj.transformations[1:]
-                                            if trafo not in self.rate_only_trafos
+                                            if not trafo.affects_rate_only
                                         )
                                         break
                         else:
@@ -814,7 +810,6 @@ class DatacardWriter(object):
                             h_up *= safe_div(n, u)
 
                         elif trafo in {ParameterTransformation.envelope, ParameterTransformation.envelope_if_one_sided}:
-                            d, u = integral(h_down), integral(h_up)
                             v_nom = h_nom.view()
                             v_down = h_down.view()
                             v_up = h_up.view()
@@ -854,8 +849,8 @@ class DatacardWriter(object):
 
                     # custom hook to modify the shapes
                     h_nom, h_down, h_up = self.modify_parameter_shape(
-                        cat_name,
-                        proc_name,
+                        cat_obj,
+                        proc_obj,
                         param_obj,
                         h_nom,
                         h_down,
@@ -885,7 +880,7 @@ class DatacardWriter(object):
                     if proc_name in proc_hists:
                         h_data.extend([hd["nominal"] for hd in proc_hists[proc_name].values()])
                     else:
-                        logger.warning(f"process '{proc_name}' not found in histograms for created fake data, skipping")
+                        logger.warning(f"process '{proc_name}' not found in histograms for creating fake data, skipping")
                 if not h_data:
                     proc_str = ",".join(map(str, cat_obj.data_from_processes))
                     raise Exception(f"none of requested processes '{proc_str}' found to create fake data")
@@ -982,10 +977,26 @@ class DatacardWriter(object):
 
         return lines[:n_rate_lines], lines[n_rate_lines:]
 
+    def modify_before_write(
+        self,
+        blocks: DotDict[str, list],
+        separators: set[str],
+        empty_lines: set[str],
+    ) -> tuple[DotDict[str, list], set[str], set[str]]:
+        """
+        Hook to modify the datacard blocks, empty lines and separators before they are written to the datacard file.
+
+        :param blocks: Datacard blocks.
+        :param separators: Set of block names after which a separator line should be inserted.
+        :param empty_lines: Set of block names after which an empty line should be inserted.
+        :returns: The modified datacard blocks, separators and empty lines.
+        """
+        return blocks, separators, empty_lines
+
     def modify_parameter_effect(
         self,
-        category: str,
-        process: str,
+        cat_obj: DotDict,
+        proc_obj: DotDict,
         param_obj: DotDict,
         effect: float | tuple[float, float],
     ) -> float | tuple[float, float]:
@@ -993,8 +1004,8 @@ class DatacardWriter(object):
         Custom hook to modify the effect of a parameter on a given category and process before it is encoded into the
         datacard. By default, this does nothing and simply returns the given effect.
 
-        :param category: The category name.
-        :param process: The process name.
+        :param cat_obj: The category object, following :py:meth:`columnflow.inference.InferenceModel.category_spec`.
+        :param proc_obj: The process object, following :py:meth:`columnflow.inference.InferenceModel.process_spec`.
         :param param_obj: The parameter object, following :py:meth:`columnflow.inference.InferenceModel.parameter_spec`.
         :param effect: The effect value(s) to be modified.
         :returns: The modified effect value(s).
@@ -1003,8 +1014,8 @@ class DatacardWriter(object):
 
     def modify_parameter_shape(
         self,
-        category: str,
-        process: str,
+        cat_obj: DotDict,
+        proc_obj: DotDict,
         param_obj: DotDict,
         h_nom: hist.Hist,
         h_down: hist.Hist,
@@ -1014,8 +1025,8 @@ class DatacardWriter(object):
         Custom hook to modify the nominal and varied (down, up) shapes of a parameter on a given category and process
         before they are saved to the shapes file. By default, this does nothing and simply returns the given histograms.
 
-        :param category: The category name.
-        :param process: The process name.
+        :param cat_obj: The category object, following :py:meth:`columnflow.inference.InferenceModel.category_spec`.
+        :param proc_obj: The process object, following :py:meth:`columnflow.inference.InferenceModel.process_spec`.
         :param param_obj: The parameter object, following :py:meth:`columnflow.inference.InferenceModel.parameter_spec`.
         :param h_nom: The nominal histogram.
         :param h_down: The down-varied histogram.
@@ -1023,3 +1034,23 @@ class DatacardWriter(object):
         :returns: The modified nominal and varied (down, up) histograms.
         """
         return h_nom, h_down, h_up
+
+    def check_skip_process(
+        self,
+        cat_obj: DotDict,
+        proc_obj: DotDict,
+        h: hist.Hist,
+    ) -> bool | str:
+        """
+        Custom hook to check if a process in a given category should be skipped entirely based on the nominal histogram
+        and the process and category objects. If a string is returned, it is added to the log message as a reason for
+        skipping the process.
+
+        :param cat_obj: The category object, following :py:meth:`columnflow.inference.InferenceModel.category_spec`.
+        :param proc_obj: The process object, following :py:meth:`columnflow.inference.InferenceModel.process_spec`.
+        :param h: The nominal histogram for the process in the category.
+        :returns: Whether to skip the process, and optionally a reason for skipping.
+        """
+        if proc_obj.skip_if_empty and np.all(h.view().value == 0):
+            return "nominal histogram is empty"
+        return False

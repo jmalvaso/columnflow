@@ -12,8 +12,10 @@ import os
 import sys
 import re
 import math
+import copy
 import time
 import enum
+import uuid
 import inspect
 import threading
 import dataclasses
@@ -27,9 +29,9 @@ import order as od
 
 from columnflow.util import (
     UNSET, maybe_import, classproperty, DotDict, DerivableMeta, CachedDerivableMeta, Derivable, pattern_matcher,
-    get_source_code, real_path, freeze, get_docs_url,
+    get_source_code, real_path, freeze,
 )
-from columnflow.types import Sequence, Callable, Any, T, Generator, Hashable, TYPE_CHECKING
+from columnflow.types import Sequence, Callable, Any, T, Generator, Hashable, TypeAlias, Union, TYPE_CHECKING
 
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
@@ -1114,9 +1116,19 @@ def sorted_ak_to_root(
     if not os.path.exists(os.path.dirname(path)):
         os.makedirs(os.path.dirname(path))
 
+    # helper to linearize nested arrays
+    def pack(ak_array, prefix=""):
+        packed = {}
+        for field in ak_array.fields:
+            if ak_array[field].fields:
+                packed.update(pack(ak_array[field], prefix + field + "_"))
+            else:
+                packed[prefix + field] = ak_array[field]
+        return packed
+
     # create the file
     f = uproot.recreate(path)
-    f[tree_name] = {field: ak_array[field] for field in ak_array.fields}
+    f[tree_name] = pack(ak_array)
     f.close()
 
 
@@ -1173,6 +1185,57 @@ def mask_from_indices(indices: np.array | ak.Array, layout_array: ak.Array) -> a
     flat_mask[flat_indices] = True
     # layout the mask
     return layout_ak_array(flat_mask, layout_array)
+
+
+def embed_with_mask(
+    ak_array: ak.Array,
+    embed_mask: ak.Array,
+    layout_array: ak.Array,
+    *,
+    value: Any = UNSET,
+    dtype: Any = None,
+    flat: bool = False,
+) -> ak.Array:
+    """
+    Embeds the values of an *ak_array* into a new array shaped like *layout_array* at locations defined by
+    *embed_mask*. The missing values are taken from *layout_array* when *value* is not set, and set to *value* with a
+    custom *dtype* otherwise.
+
+    Example:
+
+    :code-block:: python
+
+        data = ak.Array([1, 2])
+        embed_mask = [True, False, False, True]
+        layout_array = [w, x, y, z]
+        value = 99
+
+        embed_with_mask(data, embed_mask, layout_array, value=99)
+        # -> [1, 99, 99, 2]
+
+    :param ak_array: The array with data to embed into a new, larger array.
+    :param embed_mask: The boolean mask defining the locations to embed the values of *ak_array*.
+    :param layout_array: The array defining the layout of the output array.
+    :param value: The value to fill in for missing values when *value* is set.
+    :param dtype: The data type to use when *value* is set.
+    :param flat: Whether to return the output array in a flattened form.
+    :return: A new array shapes like *layout_array* with values of *ak_array* at locations defined by *embed_mask*.
+    """
+    # define the new array in a flattened form
+    flat_out_array = flat_np_view(
+        ak.copy(layout_array)
+        if value is UNSET
+        else full_like(layout_array, value, dtype=dtype),
+    )
+
+    # define the location mask based on the embed mask
+    broadcasted_embed_mask = ak.fill_none(full_like(layout_array, True, dtype=bool), True, axis=1) & embed_mask
+
+    # insert flat data array into the output array
+    flat_out_array[flat_np_view(broadcasted_embed_mask)] = flat_np_view(ak_array)
+
+    # optionally restructure the output array
+    return flat_out_array if flat else layout_ak_array(flat_out_array, layout_array)
 
 
 def full_like(layout_array: ak.Array, value: Any, *, dtype: Any = None, **kwargs) -> ak.Array:
@@ -1285,7 +1348,7 @@ def attach_coffea_behavior(
     # update or reduce collection info
     _collections = default_coffea_collections
     if isinstance(collections, dict):
-        _collections = _collections.copy()
+        _collections = copy.deepcopy(_collections)
         _collections.update(collections)
     elif isinstance(collections, (list, tuple)):
         _collections = {
@@ -1363,8 +1426,7 @@ def flat_np_view(ak_array: ak.Array, axis: int | None = None, copy: bool = False
 def ak_copy(ak_array: ak.Array) -> ak.Array:
     """
     Workaround for ``ak.copy`` which currently fails to copy arrays with coffea nano-style behavior
-    attached to them. As soon as this is functional again, this function should be deprecated and
-    removed.
+    attached to them.
     """
     return layout_ak_array(np.array(ak.flatten(ak_array)), ak_array)
 
@@ -1385,6 +1447,59 @@ def ak_concatenate_safe(arrays: Sequence[ak.Array], *args, **kwargs) -> ak.Array
     :return: The concatenated array.
     """
     return ak.concatenate(list(map(ak.to_packed, arrays)), *args, **kwargs)
+
+
+class ArraySource(dict):
+    """
+    Wrapper around a mapping from column name to arrays, and implementing the minimal interface to be used as an array
+    source for :py:meth:`~coffea.nanoevents.NanoEventsFactory.from_preloaded`.
+    """
+
+    def __init__(self, ak_array: ak.Array | dict[str, ak.Array], object_path: str = "/Events;1") -> None:
+        # decompose ak array if needed
+        if not isinstance(ak_array, dict):
+            ak_array = flatten_ak_array(ak_array)
+        if not ak_array:
+            raise ValueError("cannot create ArraySource from empty input array")
+
+        # initialize the dict
+        super().__init__(ak_array)
+
+        # store metadata
+        self.metadata = {
+            "uuid": str(uuid.uuid4()),
+            "object_path": object_path,
+            "num_rows": len(self[list(self.keys())[0]]),
+        }
+
+
+def attach_nano_schema(
+    ak_array: ak.Array,
+    schema_cls: Any = None,
+) -> ak.Array:
+    """
+    Attaches coffea's nano schema to an *ak_array* and returns it. This is required to make use of the full nano
+    behavior.
+
+    :param ak_array: The input array.
+    :param schema_cls: The nano schema class to attach. Defaults to ``coffea.nanoevents.schemas.NanoAODSchema``.
+    :return: The array with the schema attached.
+    """
+    import coffea.nanoevents
+
+    # default schema_cls
+    if schema_cls is None:
+        schema_cls = coffea.nanoevents.schemas.NanoAODSchema
+
+    # wrap array into source object
+    source = ArraySource(ak_array)
+
+    # build the factory and return events
+    factory = coffea.nanoevents.NanoEventsFactory.from_preloaded(
+        source,
+        schemaclass=schema_cls,
+    )
+    return factory.events()
 
 
 class RouteFilter(object):
@@ -1673,7 +1788,7 @@ class ArrayFunction(Derivable):
     check_used_columns = True
     check_produced_columns = True
     _dependency_sets = {"uses", "produces"}
-    log_runtime = law.config.get_expanded_boolean("analysis", "log_array_function_runtime", False)
+    log_runtime = law.config.get_expanded_bool("analysis", "log_array_function_runtime", False)
 
     # flags for declaring inputs (via uses) or outputs (via produces)
     class IOFlag(enum.Flag):
@@ -1684,25 +1799,27 @@ class ArrayFunction(Derivable):
     # shallow wrapper around an object (a class or instance) and an IOFlag
     IOFlagged = namedtuple("IOFlagged", ["wrapped", "io_flag"])
 
-    # shallow wrapper around any object that returns the object itself in its default call method
-    # given an array function instance (can be easily subclassed to return something else)
+    # shallow wrapper around any object that returns the object itself in its default call method given an array
+    # function instance (can be easily subclassed to return something else)
     class DeferredColumn(object):
+
+        decorate_attr = "__call__"
 
         @classmethod
         def deferred_column(
-            cls: ArrayFunction.DeferredColumn,
+            cls,
             call_func: Callable[[ArrayFunction], Any | set[Any]] | None = None,
-        ) -> ArrayFunction.DeferredColumn | Callable:
+        ) -> type[ArrayFunction.DeferredColumn] | Callable:
             """
-            Subclass factory to be used as a decorator wrapping a *call_func* that will be used as
-            the new ``__call__`` method. Note that the use of ``super()`` inside the decorated
-            method should always be done with arguments (i.e., class and instance).
+            Subclass factory to be used as a decorator wrapping a *call_func* that will be used as the new ``__call__``
+            method (depending on :py:attr:`decorate_attr`). Note that the use of ``super()`` inside the decorated method
+            should always be done with arguments (i.e., class and instance).
             """
             def decorator(
                 call_func: Callable[[ArrayFunction], Any | set[Any]],
-            ) -> ArrayFunction.DeferredColumn:
+            ) -> type[ArrayFunction.DeferredColumn]:
                 cls_dict = {
-                    "__call__": call_func,
+                    cls.decorate_attr: call_func,
                     "__doc__": call_func.__doc__,
                 }
 
@@ -1729,6 +1846,9 @@ class ArrayFunction(Derivable):
                 else set(columns)
             )
 
+        def __repr__(self) -> str:
+            return f"<{self.__class__.__qualname__}.{self.__class__.__name__} at {hex(id(self))}>"
+
         def __call__(self, func: ArrayFunction) -> Any | set[Any]:
             # default implementation
             return self.get()
@@ -1736,6 +1856,34 @@ class ArrayFunction(Derivable):
         def get(self) -> Any | set[Any]:
             # return the first column if there is just one, otherwise all
             return list(self.columns)[0] if len(self.columns) == 1 else self.columns
+
+    class ConditionalColumn(DeferredColumn):
+
+        decorate_attr = "condition"
+
+        def __init__(self, *columns: Any, negated: bool = False) -> None:
+            super().__init__(*columns)
+            self.negated = bool(negated)
+
+        def __repr__(self) -> str:
+            neg_str = " (negated)" if self.negated else ""
+            return f"<{self.__class__.__qualname__}.{self.__class__.__name__}{neg_str} at {hex(id(self))}>"
+
+        def __call__(self, func: ArrayFunction) -> Any | set[Any]:
+            return self.get() if self.condition(func) != self.negated else None
+
+        def __neg__(self) -> ArrayFunction.ConditionalColumn:
+            return self.negate()
+
+        def __invert__(self) -> ArrayFunction.ConditionalColumn:
+            return self.negate()
+
+        def condition(self, func: ArrayFunction) -> bool:
+            # default implementation
+            return True
+
+        def negate(self) -> ArrayFunction.ConditionalColumn:
+            return self.__class__(*self.columns, negated=not self.negated)
 
     @classproperty
     def AUTO(cls) -> IOFlagged:
@@ -1981,7 +2129,7 @@ class ArrayFunction(Derivable):
             self.pre_init_func()
 
         # create dependencies once
-        instance_cache = instance_cache or {}
+        instance_cache = instance_cache.copy() if instance_cache else {}
         self.create_dependencies(instance_cache)
 
         # run this instance's init function which might update dependent classes
@@ -2009,7 +2157,7 @@ class ArrayFunction(Derivable):
             cls = cls_or_inst if is_cls else cls_or_inst.__class__
 
             # skip when the dependency is already present
-            if only_update and cls in self.deps:
+            if cls in self.deps:
                 return self.deps[cls]
 
             # create or get the instance
@@ -2246,32 +2394,26 @@ class ArrayFunction(Derivable):
         return results
 
 
-# shorthand
+# shorthands
 deferred_column = ArrayFunction.DeferredColumn.deferred_column
+conditional_column = ArrayFunction.ConditionalColumn.deferred_column
 
 
-@deferred_column
-def IF_DATA(self: ArrayFunction.DeferredColumn, func: ArrayFunction) -> Any | set[Any]:
-    return self.get() if func.dataset_inst.is_data else None
+@conditional_column
+def IF_DATA(self, func: ArrayFunction) -> bool:
+    return func.dataset_inst.is_data
 
 
-@deferred_column
-def IF_MC(self: ArrayFunction.DeferredColumn, func: ArrayFunction) -> Any | set[Any]:
-    return self.get() if func.dataset_inst.is_mc else None
+@conditional_column
+def IF_MC(self, func: ArrayFunction) -> bool:
+    return func.dataset_inst.is_mc
 
 
-def IF_DATASET_HAS_TAG(*args, negate: bool = False, **kwargs) -> ArrayFunction.DeferredColumn:
-    @deferred_column
-    def deferred(
-        self: ArrayFunction.DeferredColumn,
-        func: ArrayFunction,
-    ) -> Any | set[Any]:
-        return self.get() if func.dataset_inst.has_tag(*args, **kwargs) is not negate else None
-
-    return deferred
-
-
-IF_DATASET_NOT_HAS_TAG = partial(IF_DATASET_HAS_TAG, negate=True)
+def IF_DATASET_HAS_TAG(*args, negate: bool = False, **kwargs) -> ArrayFunction.ConditionalColumn:
+    @conditional_column
+    def condition(self, func: ArrayFunction) -> bool:
+        return func.dataset_inst.has_tag(*args, **kwargs) != bool(negate)
+    return condition
 
 
 def tagged_column(
@@ -2680,19 +2822,6 @@ class TaskArrayFunction(ArrayFunction, metaclass=TaskArrayFunctionMeta):
         if attr in self.inst_dict:
             return self.inst_dict[attr]
 
-        # extra warnings for a limited period of time to ensure a smooth transition to the new
-        # task array function interface
-        if attr in {"task", "global_shift_inst", "local_shift_inst"}:
-            docs_url1 = get_docs_url("user_guide", "task_array_functions.html")
-            docs_url2 = get_docs_url("user_guide", "02_03_transition.html")
-            logger.warning_once(
-                f"taf_interface_deprected_{attr}",
-                f"direct access to attribute '{attr}' was removed in favor of a) using the 'task' "
-                "instance passed as an argument to most task array function hooks, or b) using the "
-                "correct task array function hook for the specific use case (e.g. pre_init() or "
-                f"post_init() instead of init()); see {docs_url1} and {docs_url2} for more info",
-            )
-
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{attr}'")
 
     def __str__(self) -> str:
@@ -2996,67 +3125,6 @@ class TAFConfig:
         return self.__class__(self.__dict__ | kwargs)
 
 
-def coffea_nano_factory_from_root(
-    source: str | uproot.ReadOnlyDirectory,
-    tree_name: str,
-    *,
-    mode: str = "eager",
-    disable_cache: bool = True,
-    read_columns: Sequence[str | Route] | set[str | Route] | None = None,
-    entry_start: int | None = None,
-    entry_stop: int | None = None,
-    read_options: dict[str, Any] | None = None,
-) -> coffea.nanoevents.NanoEventsFactory:
-    """
-    Eagerly reads a tree named *tree_name* from a root file *source*, which can either be a path or an opened uproot
-    file, and attaches the full nano behavior to its contents.
-
-    :param source: File path or opened uproot file.
-    :param tree_name: Name of the tree to read.
-    :param mode: Reading mode passed to ``coffea.nanoevents.NanoEventsFactory.from_root``.
-    :param disable_cache: If *True*, disables all caching mechanisms in the upstream coffea and root methods.
-    :param read_columns: Sequence or set of columns to read. Supports patterns.
-    :param entry_start: First entry to read, if given.
-    :param entry_stop: Last entry to read, if given.
-    :param read_options: Additional options passed to ``coffea.nanoevents.NanoEventsFactory.from_root``.
-    :return: The created ``coffea.nanoevents.NanoEventsFactory`` instance.
-    """
-    import coffea.nanoevents
-
-    # default read options
-    read_options = read_options or {}
-    read_options["mode"] = "eager"
-
-    # disable caching
-    if disable_cache:
-        arg_names = set(inspect.getfullargspec(coffea.nanoevents.NanoEventsFactory.from_root).kwonlyargs)
-        for cache_arg in ["runtime_cache", "persistent_cache", "buffer_cache"]:
-            if cache_arg in arg_names:
-                read_options[cache_arg] = None
-
-    # inject read_columns
-    if read_columns and "filter_name" not in read_options.get("iteritems_options", {}):
-        filter_name = [Route(s).string_nano_column for s in read_columns]
-
-        # add names prefixed with an 'n' to the list of columns to read
-        # (needed to construct the nested list structure of jagged columns)
-        maybe_jagged_fields = {Route(s)[0] for s in read_columns}
-        filter_name.extend(f"n{field}" for field in maybe_jagged_fields)
-
-        read_options.setdefault("iteritems_options", {})["filter_name"] = filter_name
-
-    # create the factory
-    factory = coffea.nanoevents.NanoEventsFactory.from_root(
-        source,
-        treepath=tree_name,
-        entry_start=entry_start,
-        entry_stop=entry_stop,
-        **read_options,
-    )
-
-    return factory
-
-
 class NoThreadPool(object):
     """
     Dummy implementation that mimics parts of the usual thread pool interface but instead of
@@ -3160,205 +3228,6 @@ class TaskQueue(object):
         return task
 
 
-class DaskArrayReader(object):
-    """
-    Class that wraps a dask_awkward array and handles chunked reading via splitting and merging of
-    materialized partitions. To allow memory efficient caching in case of overlaps between
-    partitions on disk and chunks to be read (possibly with different sizes) this process is
-    implemented as a one-time-only read operation. Hence, in situations where particular chunks need
-    to be read more than once, another instance of this class should be used.
-    """
-
-    class MaterializationStrategy(enum.Flag):
-        """
-        Flag to define which materialization strategy to follow.
-        """
-        SLICES = enum.auto()
-        PARTITIONS = enum.auto()
-
-    def __init__(
-        self,
-        path: str,
-        open_options: dict | None = None,
-        materialization_strategy: MaterializationStrategy = MaterializationStrategy.PARTITIONS,
-    ) -> None:
-        super().__init__()
-
-        open_options = open_options or {}
-
-        # backwards compatibility: when row group splitting is enbaled (the default), detect whether
-        # the input file was written with support for that; a file does not support splitting in
-        # case nested nodes separated by "*.list.element.*" (rather than "*.list.item.*") are found
-        # (to be removed in the future)
-        if open_options.get("split_row_groups"):
-            try:
-                nodes = ak.ak_from_parquet.metadata(path)[0]
-            except:
-                logger.error(f"unable to read {path}")
-                raise
-            cre = re.compile(r"^.+\.list\.element(|\..+)$")
-            if any(map(cre.match, nodes)):
-                logger.warning(
-                    f"while reading input parquet file from {path}, 'split_row_groups' is enabled "
-                    "but the file does not support it; it was probably created with an older "
-                    "version of columnflow which did not make use of this feature; row group "
-                    "splitting will be disabled, potentially leading to suboptimal performance",
-                )
-                open_options["split_row_groups"] = False
-
-        # open the file
-        import dask_awkward as dak
-        self.dak_array = dak.from_parquet(path, **open_options)
-        self.path = path
-
-        # strategy dependent attributes and setup
-        self.materialization_strategy = materialization_strategy
-        if materialization_strategy == self.MaterializationStrategy.PARTITIONS:
-            # fixed mapping of chunk to partition indices, created in _materialize_via_partitions
-            self.chunk_to_partitions = {}
-
-            # mapping of partition indices to cache information (chunks still to be handled and a
-            # cached array) that changes during the read process in _materialize_via_partitions
-            self.partition_cache = {
-                p: DotDict(chunks=set(), array=None)
-                for p in range(self.dak_array.npartitions)
-            }
-
-            # locks to protect against RCs during read operations by different threads
-            self.chunk_to_partitions_lock = threading.Lock()
-            self.partition_locks = {p: threading.Lock() for p in range(self.dak_array.npartitions)}
-
-    def __del__(self) -> None:
-        self.close()
-
-    def __len__(self) -> int:
-        if not self.dak_array.known_divisions:
-            self.dak_array.eager_compute_divisions()
-        return len(self.dak_array)
-
-    @property
-    def closed(self) -> bool:
-        return self.dak_array is None
-
-    def close(self) -> None:
-        # free memory
-        self.dak_array = None
-        if getattr(self, "partition_cache", None):
-            self.partition_cache.clear()
-
-    def materialize(self, *args, **kwargs) -> ak.Array:
-        """
-        Materializes (reads from disk) a slice of the array using the configured
-        :py:attr:`materialization_strategy`. All *args* and *kwargs* are forwarded to the internal
-        implementations.
-
-        :return: The materialized array.
-        """
-        if self.materialization_strategy == self.MaterializationStrategy.SLICES:
-            return self._materialize_via_slices(*args, **kwargs)
-
-        if self.materialization_strategy == self.MaterializationStrategy.PARTITIONS:
-            return self._materialize_via_partitions(*args, **kwargs)
-
-        raise NotImplementedError(
-            f"unknown materialization strategy {self.materialization_strategy}",
-        )
-
-    def _materialize_via_slices(
-        self,
-        *,
-        chunk_index: int,
-        entry_start: int,
-        entry_stop: int,
-        max_chunk_size: int,
-    ) -> ak.Array:
-        # NOTE: calling `compute()` will materialize the data from the full dataset in memory
-        # even if we only return a slice of the data.
-        return self.dak_array[entry_start:entry_stop].compute()
-
-    def _materialize_via_partitions(
-        self,
-        *,
-        chunk_index: int,
-        entry_start: int,
-        entry_stop: int,
-        max_chunk_size: int,
-    ) -> ak.Array:
-        # slicing on dak arrays was not supported for a long time, i.e. arr[start:stop].compute()
-        # used to raise a DaskAwkwardNotImplemented, but it seems to be supported now, so the
-        # following code might be obsolete, but it is kept for now as a fallback and as a potential
-        # alternative in case the slicing implementation is not as efficient as the partition one,
-        # reasons:
-        # 1. in cf, there are typically no parquet files from external sources, but they are all
-        #    created within cf and thus, they typical partition sizes exactly match the desired
-        #    chunk size (as they were created in a chunked way and eventually merged), leading to
-        #    zero overhead and no caching / overlap issues
-        # 2. it seems far more performant to read full partitions from disk rather than parts of
-        #    them (if possible at all) since meta data might have to be read in any case
-        # strategy: read from disk with granularity given by partition divisions
-        #   - use chunk info to determine which partitions need to be read
-        #   - guard each read operation of a partition by locks
-        #   - add materialized partitions that might overlap with another chunk in a temporary cache
-        #   - remove cached partitions eagerly once it becomes clear that no chunk will need it
-
-        # fill the chunk -> partitions mapping once
-        with self.chunk_to_partitions_lock:
-            if not self.chunk_to_partitions:
-                if not self.dak_array.known_divisions:
-                    self.dak_array.eager_compute_divisions()
-                divs = tuple(map(int, self.dak_array.divisions))
-                # note: a hare-and-tortoise algorithm could be possible to get the mapping with less
-                # than n^2 complexity, but for our case with ~30 chunks this should be ok (for now)
-                n_chunks = int(math.ceil(len(self) / max_chunk_size))
-                # in case there are no entries, ensure that at least one empty chunk is created
-                for _chunk_index in range(max(n_chunks, 1)):
-                    _entry_start = _chunk_index * max_chunk_size
-                    _entry_stop = min(_entry_start + max_chunk_size, len(self))
-                    partitions = []
-                    for p, (p_start, p_stop) in enumerate(zip(divs[:-1], divs[1:])):
-                        # note: check strict increase of chunk size to accommodate zero-length size
-                        if p_stop <= _entry_start < _entry_stop:
-                            continue
-                        if p_start >= _entry_stop > _entry_start:
-                            break
-                        partitions.append(p)
-                        self.partition_cache[p].chunks.add(_chunk_index)
-                    self.chunk_to_partitions[_chunk_index] = partitions
-
-        # read partitions one at a time and store parts that make up the chunk for concatenation
-        parts = []
-        for p in self.chunk_to_partitions[chunk_index]:
-            # obtain the array
-            with self.partition_locks[p]:
-                # remove this chunk from the list of chunks to be handled
-                self.partition_cache[p].chunks.remove(chunk_index)
-
-                if self.partition_cache[p].array is None:
-                    arr = self.dak_array.partitions[p].compute()
-                    # add to cache when there is a chunk left that will need it
-                    if self.partition_cache[p].chunks:
-                        self.partition_cache[p].array = arr
-                else:
-                    arr = self.partition_cache[p].array
-                    # remove from cache when there is no chunk left that would need it
-                    if not self.partition_cache[p].chunks:
-                        self.partition_cache[p].array = None
-
-            # add part for concatenation using entry info
-            div_start, div_stop = self.dak_array.divisions[p:p + 2]
-            part_start = max(entry_start - div_start, 0)
-            part_stop = min(entry_stop - div_start, div_stop - div_start)
-            parts.append(arr[part_start:part_stop])
-
-        # construct the full array
-        arr = ak.to_packed(parts[0]) if len(parts) == 1 else ak_concatenate_safe(parts, axis=0)
-
-        # cleanup
-        del parts
-
-        return arr
-
-
 class ChunkedParquetReader(object):
     """
     Class that wraps a parquet file containing an awkward array and handles chunked reading via splitting and merging of
@@ -3369,23 +3238,21 @@ class ChunkedParquetReader(object):
 
     def __init__(self, path: str, open_options: dict | None = None) -> None:
         super().__init__()
-        if not open_options:
-            open_options = {}
 
         # store attributes
         self.path = path
-        self.open_options = open_options.copy()
+        self.open_options = copy.deepcopy(open_options) if open_options else {}
 
         # open and store meta data with updated open options
         # (when closing the reader, this attribute is set to None)
-        meta_options = open_options.copy()
+        meta_options = copy.deepcopy(open_options)
         meta_options.pop("row_groups", None)
         meta_options.pop("ignore_metadata", None)
         meta_options.pop("columns", None)
         try:
             self.metadata = ak.metadata_from_parquet(path, **meta_options)
         except:
-            logger.error(f"unable to read {path}")
+            logger.error(f"unable to read meta data with options {meta_options} from {path}")
             raise
 
         # extract row group sizes for chunked reading
@@ -3498,6 +3365,64 @@ class ChunkedParquetReader(object):
         return arr
 
 
+def slice_across_chunks(
+    slice_funcs: Sequence[Callable[[int, int], ak.Array | np.ndarray]],
+    sizes: Sequence[int],
+    entry_start: int | None = None,
+    entry_stop: int | None = None,
+) -> ak.Array | np.ndarray:
+    """
+    Loads multiple array chunks, concatenates them and returns the result. Each chunk is loaded by its own slicing
+    function in *slice_funcs* which receives the start and stop entry of the chunk to load. The total sizes of the
+    chunks are given in *sizes* and used for internal range calculation. By default, the full range of all chunks is
+    loaded, but this can be limited by setting *entry_start* and *entry_stop* to the global start and stop entry to
+    load, respectively.
+
+    :param slice_funcs: The slicing/loading function that provide chunks.
+    :param sizes: The total sizes per chunks for internal range calculation.
+    :param entry_start: The global start entry to load. Defaults to the start of the first chunk.
+    :param entry_stop: The global stop entry to load. Defaults to the end of the last chunk.
+    :return: The concatenated array of all loaded chunks.
+    """
+    if len(slice_funcs) != len(sizes):
+        raise ValueError(
+            f"slice_funcs and sizes must have the same length, but got {len(slice_funcs)} and {len(sizes)}",
+        )
+
+    # collect arrays according to chunk ranges
+    arrays = []
+    chunk_ranges = law.util.chunk_slice_ranges(sizes, entry_start, entry_stop)
+    for r, slice_func in zip(chunk_ranges, slice_funcs):
+        if r is not None:
+            start, stop = r
+            arrays.append(slice_func(start, stop))
+
+    if not arrays:
+        raise ValueError(f"no array chunks loaded, ranges were {chunk_ranges}")
+
+    # check if and how to concatenate
+    if len(arrays) == 1:
+        array = arrays[0]
+    elif any(isinstance(arr, ak.Array) for arr in arrays):
+        # at least one array is awkward, so concatenate safely
+        array = ak_concatenate_safe(arrays, axis=0)
+    else:
+        array = np.concatenate(arrays, axis=0)
+    del arrays
+
+    return array
+
+
+# alias to summarize possible root handler input types for read_*_root methods below
+RootHandlerInput: TypeAlias = Union[
+    str,
+    uproot.ReadOnlyDirectory,
+    uproot.TTree,
+    tuple[str, str],
+    tuple[uproot.ReadOnlyDirectory, str],
+]
+
+
 class ChunkedIOHandler(object):
     """
     Allows reading one or multiple files and iterating through chunks of their content with
@@ -3571,6 +3496,12 @@ class ChunkedIOHandler(object):
         ["index", "entry_start", "entry_stop", "max_chunk_size", "n_chunks"],
     )
 
+    # filter config container
+    FilterConfig = namedtuple(
+        "FilterConfig",
+        ["filter_func", "read_columns"],
+    )
+
     # read result container
     ReadResult = namedtuple(
         "ReadResult",
@@ -3590,9 +3521,10 @@ class ChunkedIOHandler(object):
         open_options: dict | Sequence[dict] | None = None,
         read_options: dict | Sequence[dict] | None = None,
         read_columns: set | Sequence[set] | None = None,
+        filter_config: FilterConfig | Sequence[FilterConfig] | None = None,
         iter_message: str = "handling chunk {pos.index}",
-        debug: bool = law.config.get_expanded_boolean("analysis", "chunked_io_debug", False),
-    ):
+        debug: bool = law.config.get_expanded_bool("analysis", "chunked_io_debug", False),
+    ) -> None:
         super().__init__()
 
         # multiple inputs?
@@ -3612,14 +3544,11 @@ class ChunkedIOHandler(object):
                 if len(value) != self.n_sources:
                     if len(value) != 1:
                         raise Exception(
-                            f"length of {name} should match length of source ({self.n_sources}), "
-                            f"but got {len(value)}",
+                            f"length of {name} should match length of source ({self.n_sources}), but got {len(value)}",
                         )
                     value *= self.n_sources
             elif is_multi(value):
-                raise Exception(
-                    f"when source is not a sequence, {name} should neither, but got '{value}'",
-                )
+                raise Exception(f"when source is not a sequence, {name} should neither, but got '{value}'")
             return value
 
         # check args
@@ -3627,6 +3556,7 @@ class ChunkedIOHandler(object):
         open_options = _check_arg("open_options", open_options)
         read_options = _check_arg("read_options", read_options)
         read_columns = _check_arg("read_columns", read_columns)
+        filter_config = _check_arg("filter_config", filter_config)
 
         # store input attributes
         self.source_list = list(source) if self.is_multi else [source]
@@ -3634,22 +3564,23 @@ class ChunkedIOHandler(object):
         self.open_options_list = list(open_options) if self.is_multi else [open_options]
         self.read_options_list = list(read_options) if self.is_multi else [read_options]
         self.read_columns_list = list(read_columns) if self.is_multi else [read_columns]
+        self.filter_config_list = list(filter_config) if self.is_multi else [filter_config]
         self.chunk_size = chunk_size
         self.pool_size = max(pool_size, 1)
         self.iter_message = iter_message
 
         # attributes that are set in open(), close() or __iter__()
         self.source_objects = []
-        self.n_entries = None
+        self.chunk_positions: list[list[ChunkedIOHandler.ChunkPosition]] = []
+        self.n_entries_total = None
+        self.n_entries_filtered = None
         self.task_queue = TaskQueue()
         self.pool_cls = multiprocessing.pool.ThreadPool
         self.pool = None
 
         # debug settings
         if debug:
-            logger.info(
-                f"{self.__class__.__name__} set to debug mode, using in-thread pool with size 1",
-            )
+            logger.info(f"{self.__class__.__name__} set to debug mode, using in-thread pool with size 1")
             self.pool_size = 1
             self.pool_cls = NoThreadPool
 
@@ -3665,19 +3596,39 @@ class ChunkedIOHandler(object):
         n_entries: int,
         chunk_size: int,
         chunk_index: int,
+        filter_mask: np.ndarray | None = None,
     ) -> ChunkPosition:
         """
         Creates and returns a :py:attr:`ChunkPosition` object based on the total number of entries
         *n_entries*, the maximum *chunk_size*, and the index of the chunk *chunk_index*.
         """
-        # determine the start of stop of this chunk
-        if n_entries == 0:
-            entry_start = 0
-            entry_stop = 0
-            n_chunks = 0
-        else:
+        # defaults
+        entry_start = 0
+        entry_stop = 0
+        n_chunks = 0
+
+        if n_entries > 0:
+            # compute start and stop indices
             entry_start = chunk_index * chunk_size
             entry_stop = min((chunk_index + 1) * chunk_size, n_entries)
+
+            # apply to indices of filter mask if given
+            if filter_mask is not None:
+                # prepare indices
+                if filter_mask.dtype == bool:
+                    if len(filter_mask) != n_entries:
+                        raise Exception(
+                            f"length of filter_mask ({len(filter_mask)}) does not match n_entries ({n_entries})",
+                        )
+                    filter_indices = np.where(filter_mask)[0]
+                else:
+                    filter_indices = filter_mask
+                # evaluate indices
+                entry_start = filter_indices[entry_start]
+                entry_stop = filter_indices[entry_stop] if entry_stop < len(filter_indices) else n_entries
+                n_entries = len(filter_indices)
+
+            # final number of chunks
             n_chunks = int(math.ceil(n_entries / chunk_size))
 
         return cls.ChunkPosition(chunk_index, entry_start, entry_stop, chunk_size, n_chunks)
@@ -3705,20 +3656,22 @@ class ChunkedIOHandler(object):
             - "dask_awkward_parquet"
         """
         if source_type is None:
-            if isinstance(source, uproot.ReadOnlyDirectory):
+            # perform checks with the first source in case a list is given
+            first_source = source[0] if isinstance(source, list) and source else source
+            if isinstance(first_source, uproot.ReadOnlyDirectory):
                 # uproot file
                 source_type = "uproot_root"
-            elif isinstance(source, str):
+            elif isinstance(first_source, str):
                 # file path, guess based on extension
-                if source.endswith(".root"):
+                if first_source.endswith(".root"):
                     # priotize coffea nano events
                     source_type = "coffea_root"
-                elif source.endswith(".parquet"):
+                elif first_source.endswith(".parquet"):
                     # prioritize non-dask awkward reader
                     source_type = "awkward_parquet"
 
             if not source_type:
-                raise Exception(f"could not determine source_type from source '{source}'")
+                raise Exception(f"could not determine source_type from source '{first_source}'")
 
         if source_type == "uproot_root":
             return cls.SourceHandler(
@@ -3734,13 +3687,6 @@ class ChunkedIOHandler(object):
                 cls.close_coffea_root,
                 cls.read_coffea_root,
             )
-        if source_type == "coffea_parquet":
-            return cls.SourceHandler(
-                source_type,
-                cls.open_coffea_parquet,
-                cls.close_coffea_parquet,
-                cls.read_coffea_parquet,
-            )
         if source_type == "awkward_parquet":
             return cls.SourceHandler(
                 source_type,
@@ -3748,244 +3694,195 @@ class ChunkedIOHandler(object):
                 cls.close_awkward_parquet,
                 cls.read_awkward_parquet,
             )
-        if source_type == "dask_awkward_parquet":
-            return cls.SourceHandler(
-                source_type,
-                cls.open_dask_awkward_parquet,
-                cls.close_dask_awkward_parquet,
-                cls.read_dask_awkward_parquet,
-            )
 
         raise NotImplementedError(f"unknown source_type '{source_type}'")
 
     @classmethod
     def open_uproot_root(
         cls,
-        source: (
-            str |
-            uproot.ReadOnlyDirectory |
-            tuple[str, str] |
-            tuple[uproot.ReadOnlyDirectory, str]
-        ),
+        source: RootHandlerInput | list[RootHandlerInput],
+        *,
         open_options: dict | None = None,
         read_columns: set[str | Route] | None = None,
-    ) -> tuple[uproot.TTree, int]:
+        filter_config: FilterConfig | None = None,
+    ) -> tuple[uproot.TTree | list[uproot.TTree], int, np.ndarray | None]:
         """
-        Opens an uproot tree from a root file at *source* and returns a 2-tuple *(tree, entries)*.
-        *source* can be the path of the file, an already opened, readable uproot file (assuming the
-        tree is called "Events"), or a 2-tuple whose second item defines the name of the tree to be
-        loaded. When a new file is opened, it receives *open_options*. Passing *read_columns* has no
-        effect.
-        """
-        tree_name = "Events"
-        if isinstance(source, tuple) and len(source) == 2:
-            source, tree_name = source
-        if isinstance(source, str):
-            # default open options
-            open_options = open_options or {}
-            open_options["object_cache"] = None
-            open_options["array_cache"] = None
-            open_options.setdefault("decompression_executor", None)
-            open_options.setdefault("interpretation_executor", None)
-            f = uproot.open(source, **open_options)
-            tree = f[tree_name]
-        elif isinstance(source, uproot.ReadOnlyDirectory):
-            tree = source[tree_name]
-        else:
-            raise Exception(f"'{source}' cannot be opened as uproot_root")
+        Opens one or multiple uproot trees from root files at *source* and returns a 3-tuple
+        *(tree(s), total entries, filter mask or None)*.
 
-        return (tree, tree.num_entries)
+        *source* can be the path of the file, an already opened, readable uproot file (assuming the tree is called
+        "Events"), an uproot tree, a 2-tuple whose second item defines the name of the tree to be loaded, or a list of
+        these. When a new file is opened, it receives *open_options*. Passing *read_columns* has no effect.
+        """
+        # default open options
+        open_options = copy.deepcopy(open_options) if open_options else {}
+        open_options["object_cache"] = None
+        open_options["array_cache"] = None
+        open_options.setdefault("decompression_executor", None)
+        open_options.setdefault("interpretation_executor", None)
+
+        # helper to extract the correct tree from the source
+        def detect_tree(source: RootHandlerInput) -> uproot.TTree:
+            if isinstance(source, uproot.TTree):
+                return source
+            tree_name = "Events"
+            if isinstance(source, tuple) and len(source) == 2:
+                source, tree_name = source
+            if isinstance(source, str):
+                f = uproot.open(source, **open_options)
+                tree = f[tree_name]
+            elif isinstance(source, uproot.ReadOnlyDirectory):
+                tree = source[tree_name]
+            else:
+                raise Exception(f"'{source}' cannot be opened as uproot_root")
+            return tree
+
+        # convert source to list to treat cases identically
+        is_multi = isinstance(source, list)
+        if not source:
+            raise Exception(f"'{source}' cannot be opened as uproot_root")
+        trees = list(map(detect_tree, law.util.make_list(source)))
+        n_entries = sum(tree.num_entries for tree in trees)
+
+        # compute and attach filter masks
+        filter_mask = None
+        if filter_config:
+            routes = law.util.make_unique(map(Route, law.util.make_list(filter_config.read_columns)))
+            columns = [route.nano_column for route in routes]
+            masks = []
+            for tree in trees:
+                arrays = tree.arrays(columns)
+                mask = np.asarray(filter_config.filter_func(arrays), dtype=bool)
+                tree._cf_filter_mask = mask
+                masks.append(mask)
+            filter_mask = np.concatenate(masks, axis=0)
+
+        return (trees if is_multi else trees[0], n_entries, filter_mask)
 
     @classmethod
     def close_uproot_root(
         cls,
-        source_object: uproot.TTree,
+        source_object: uproot.TTree | list[uproot.TTree],
     ) -> None:
         """
         Closes the file that contains the TTree *source_object*.
         """
-        f = getattr(source_object, "file", None)
-        if f is not None:
-            f.close()
+        for tree in law.util.make_list(source_object):
+            # drop temporary, cf related attributes
+            for attr in dir(tree):
+                if attr.startswith("_cf_"):
+                    delattr(tree, attr)
+
+            # close the underlying file
+            f = getattr(tree, "file", None)
+            if f is not None:
+                f.close()
 
     @classmethod
     def read_uproot_root(
         cls,
-        source_object: uproot.TTree,
+        source_object: uproot.TTree | list[uproot.TTree],
         chunk_pos: ChunkPosition,
+        *,
         read_options: dict | None = None,
         read_columns: set[str | Route] | None = None,
+        filter_config: FilterConfig | None = None,
     ) -> ak.Array:
         """
-        Given an uproot TTree *source_object*, returns an awkward array chunk referred to by
-        *chunk_pos*. *read_options* are passed to ``uproot.TTree.arrays``. *read_columns* are
-        converted to strings and, if not already present, added as field ``filter_name`` to
-        *read_options*.
+        Given one or multiple uproot TTrees *source_object*, returns an awkward array chunk referred to by *chunk_pos*.
+        *read_options* are passed to ``uproot.TTree.arrays``. *read_columns* are converted to strings and added to the
+        field ``filter_name`` in *read_options*.
         """
         # default read options
-        read_options = read_options or {}
+        read_options = copy.deepcopy(read_options) if read_options else {}
         read_options["array_cache"] = None
+        read_options.pop("how", None)
 
-        # inject read_columns
-        if read_columns and "filter_name" not in read_options:
-            filter_name = [Route(s).string_nano_column for s in read_columns]
-            read_options["filter_name"] = filter_name
+        # inject filter names
+        filter_name = set(read_options.pop("filter_name", None) or ())
+        read_columns = set(read_columns or ())
+        if filter_config:
+            read_columns.update(law.util.make_set(filter_config.read_columns))
+        if read_columns:
+            routes = set(map(Route, read_columns))
+            filter_name.update(r.string_nano_column for r in routes)
+            # add names prefixed with an 'n' to the list of columns to read
+            # (needed to construct the nested list structure of jagged columns)
+            filter_name.update(f"n{r[0]}" for r in routes if len(r) > 1)
+        # add back to read options
+        if filter_name:
+            read_options["filter_name"] = list(filter_name)
 
-        chunk = source_object.arrays(
-            entry_start=chunk_pos.entry_start,
-            entry_stop=chunk_pos.entry_stop,
-            **read_options,
-        )
+        # helper to read from a single tree, optionally filtering the result
+        def load(tree, entry_start, entry_stop):
+            chunk = tree.arrays(entry_start=entry_start, entry_stop=entry_stop, **read_options)
+            if filter_config:
+                if (mask := getattr(tree, "_cf_filter_mask", None)) is None:
+                    mask = filter_config.filter_func(chunk)
+                    tree._cf_filter_mask = mask
+                chunk = ak.to_packed(chunk[mask[entry_start:entry_stop]])
+            return chunk
+
+        # load the chunk, optionally across multiple trees
+        trees = law.util.make_list(source_object)
+        tree_sizes = [tree.num_entries for tree in trees]
+        slice_funcs = [partial(load, tree) for tree in trees]
+        chunk = slice_across_chunks(slice_funcs, tree_sizes, chunk_pos.entry_start, chunk_pos.entry_stop)
 
         return chunk
 
     @classmethod
     def open_coffea_root(
         cls,
-        source: (
-            str |
-            uproot.ReadOnlyDirectory |
-            tuple[str, str] |
-            tuple[uproot.ReadOnlyDirectory, str]
-        ),
+        source: RootHandlerInput | list[RootHandlerInput],
+        *,
         open_options: dict | None = None,
         read_columns: set[str | Route] | None = None,
-    ) -> tuple[tuple[uproot.ReadOnlyDirectory, str], int]:
+        filter_config: FilterConfig | None = None,
+    ) -> tuple[tuple[uproot.ReadOnlyDirectory | list[uproot.ReadOnlyDirectory], str], int, np.ndarray | None]:
         """
-        Opens an uproot file at *source* for subsequent processing with coffea and returns a 2-tuple
-        *((uproot file, tree name), tree entries)*. *source* can be the path of the file, an already
-        opened, readable uproot file (assuming the tree is called "Events"), or a 2-tuple whose
-        second item defines the name of the tree to be loaded. *open_options* are forwarded to
-        ``uproot.open`` if a new file is opened. Passing *read_columns* has no effect.
+        Same as :py:meth:`open_uproot_root`.
         """
-        tree_name = "Events"
-        if isinstance(source, tuple) and len(source) == 2:
-            source, tree_name = source
-        if isinstance(source, str):
-            # default open options
-            open_options = open_options or {}
-            open_options["object_cache"] = None
-            open_options["array_cache"] = None
-            source = uproot.open(source, **open_options)
-            tree = source[tree_name]
-        elif isinstance(source, uproot.ReadOnlyDirectory):
-            tree = source[tree_name]
-        else:
-            raise Exception(f"'{source}' cannot be opened as coffea_root")
-
-        return ((source, tree_name), tree.num_entries)
+        return cls.open_uproot_root(
+            source=source,
+            open_options=open_options,
+            read_columns=read_columns,
+            filter_config=filter_config,
+        )
 
     @classmethod
     def close_coffea_root(
         cls,
-        source_object: tuple[str | uproot.ReadOnlyDirectory, str],
+        source_object: uproot.TTree | list[uproot.TTree],
     ) -> None:
         """
-        Closes a ROOT file referred to by the first item in a 2-tuple *source_object* if it is a
-        ``ReadOnlyDirectory``. In case a string is passed, this method does nothing.
+        Same as :py:meth:`close_uproot_root`.
         """
-        close = getattr(source_object[0], "close", None)
-        if callable(close):
-            close()
+        return cls.close_uproot_root(source_object)
 
     @classmethod
     def read_coffea_root(
         cls,
-        source_object: tuple[str | uproot.ReadOnlyDirectory, str],
+        source_object: uproot.TTree | list[uproot.TTree],
         chunk_pos: ChunkPosition,
-        read_columns: set[str | Route] | None = None,
+        *,
         read_options: dict | None = None,
+        read_columns: set[str | Route] | None = None,
+        filter_config: FilterConfig | None = None,
     ) -> ak.Array:
         """
-        Given a file location or opened uproot file, and a tree name in a 2-tuple *source_object*, returns an awkward
-        array chunk referred to by *chunk_pos*, assuming nanoAOD structure. *read_options* are passed to the
-        ``arrays()`` method of the tree. *read_columns* are converted to strings and, if not already present, added as
-        nested fields ``iteritems_options.filter_name`` to *read_options*.
+        Same as :py:meth:`read_uproot_root`, but attaches coffea's nano schema to the returned array.
         """
-        _source_object, tree_name = source_object
-        factory = coffea_nano_factory_from_root(
-            source=_source_object,
-            tree_name=tree_name,
-            read_columns=read_columns,
-            entry_start=chunk_pos.entry_start,
-            entry_stop=chunk_pos.entry_stop,
+        chunk = cls.read_uproot_root(
+            source_object=source_object,
+            chunk_pos=chunk_pos,
             read_options=read_options,
+            read_columns=read_columns,
+            filter_config=filter_config,
         )
 
-        return factory.events()
-
-    @classmethod
-    def open_coffea_parquet(
-        cls,
-        source: str,
-        open_options: dict | None = None,
-        read_columns: set[str | Route] | None = None,
-    ) -> tuple[str, int]:
-        """
-        Given a parquet file located at *source*, returns a 2-tuple *(source, entries)*. Passing
-        *open_options* or *read_columns* has no effect.
-        """
-        import pyarrow.parquet as pq
-
-        return (source, pq.ParquetFile(source).metadata.num_rows)
-
-    @classmethod
-    def close_coffea_parquet(
-        cls,
-        source_object: str,
-    ) -> None:
-        """
-        This is a placeholder method and has no effect.
-        """
-        return
-
-    @classmethod
-    def read_coffea_parquet(
-        cls,
-        source_object: str,
-        chunk_pos: ChunkPosition,
-        read_options: dict | None = None,
-        read_columns: set[str | Route] | None = None,
-    ) -> ak.Array:
-        """
-        Given a the location of a parquet file *source_object*, returns an awkward array chunk
-        referred to by *chunk_pos*, assuming nanoAOD structure. *read_options* are passed to
-        ``coffea.nanoevents.NanoEventsFactory.from_parquet``. *read_columns* are converted to
-        strings and, if not already present, added as nested field
-        ``parquet_options.read_dictionary`` to *read_options*.
-        """
-        import coffea.nanoevents
-
-        # default read options
-        read_options = read_options or {}
-        read_options["mode"] = "eager"
-        read_options["runtime_cache"] = None
-        read_options["persistent_cache"] = None
-
-        # inject read_columns
-        if read_columns and (
-            "parquet_options" not in read_options or
-            "read_dictionary" not in read_options["parquet_options"]
-        ):
-            read_dictionary = [Route(s).string_column for s in read_columns]
-
-            # add names prefixed with an 'n' to the list of columns to read
-            # (needed to construct the nested list structure of jagged columns)
-            maybe_jagged_fields = {Route(s)[0] for s in read_columns}
-            read_dictionary.extend(
-                f"n{field}"
-                for field in maybe_jagged_fields
-            )
-
-            read_options.setdefault("parquet_options", {})["read_dictionary"] = read_dictionary
-
-        # read the events chunk into memory
-        chunk = coffea.nanoevents.NanoEventsFactory.from_parquet(
-            source_object,
-            entry_start=chunk_pos.entry_start,
-            entry_stop=chunk_pos.entry_stop,
-            **read_options,
-        ).events()
+        # attach nano schema
+        chunk = attach_nano_schema(chunk)
 
         return chunk
 
@@ -3995,19 +3892,27 @@ class ChunkedIOHandler(object):
         source: str,
         open_options: dict | None = None,
         read_columns: set[str | Route] | None = None,
-    ) -> tuple[ChunkedParquetReader, int]:
+        filter_config: FilterConfig | None = None,
+    ) -> tuple[ChunkedParquetReader, int, np.ndarray | None]:
         """
         Opens a parquet file saved at *source*, loads the content as chunks of an awkward array wrapped by a
-        :py:class:`ChunkedParquetReader`, and returns a 2-tuple *(reader, length)*.
+        :py:class:`ChunkedParquetReader`, and returns a 3-tuple *(reader, total entries, filter mask or None)*.
 
         *open_options* and *chunk_size* are forwarded accordingly. *read_columns* are converted to strings and, if not
-        already present, added as field ``columns`` to *open_options*.
+        already present, added as field ``columns`` to *open_options*. Passing *filter_config* has no effect.
         """
         if not isinstance(source, str):
             raise Exception(f"'{source}' cannot be opened as awkward_parquet")
 
+        # show warning when filter config is given
+        if filter_config:
+            logger.warning_once(
+                f"{cls.__name__}_open_awkward_parquet_got_filter_config",
+                f"{cls.__name__}: filter_config is not supported for 'awkward_parquet', got '{filter_config}'",
+            )
+
         # default open options
-        open_options = open_options or {}
+        open_options = copy.deepcopy(open_options) if open_options else {}
 
         # inject read_columns
         if read_columns and "columns" not in open_options:
@@ -4017,7 +3922,7 @@ class ChunkedIOHandler(object):
         # load the array wrapper
         reader = ChunkedParquetReader(source, open_options)
 
-        return (reader, len(reader))
+        return (reader, len(reader), None)
 
     @classmethod
     def close_awkward_parquet(
@@ -4036,72 +3941,19 @@ class ChunkedIOHandler(object):
         chunk_pos: ChunkedIOHandler.ChunkPosition,
         read_options: dict | None = None,
         read_columns: set[str | Route] | None = None,
+        filter_config: FilterConfig | None = None,
     ) -> ak.Array:
         """
         Given a :py:class:`ChunkedParquetReader` *source_object*, returns the chunk referred to by *chunk_pos* as a
         full copy loaded into memory. Passing neither *read_options* nor *read_columns* has an effect.
         """
-        # get the materialized ak array for that chunk
-        return source_object.materialize(
-            chunk_index=chunk_pos.index,
-            entry_start=chunk_pos.entry_start,
-            entry_stop=chunk_pos.entry_stop,
-            max_chunk_size=chunk_pos.max_chunk_size,
-        )
+        # show warning when filter config is given
+        if filter_config:
+            logger.warning_once(
+                f"{cls.__name__}_open_awkward_parquet_got_filter_config",
+                f"{cls.__name__}: filter_config is not supported for 'awkward_parquet', got '{filter_config}'",
+            )
 
-    @classmethod
-    def open_dask_awkward_parquet(
-        cls,
-        source: str,
-        open_options: dict | None = None,
-        read_columns: set[str | Route] | None = None,
-    ) -> tuple[DaskArrayReader, int]:
-        """
-        Opens a parquet file saved at *source*, loads the content as an dask awkward array, wrapped by a
-        :py:class:`DaskArrayReader`, and returns a 2-tuple *(reader, length)*.
-
-        *open_options* and *chunk_size* are forwarded to :py:class:`DaskArrayReader`. *read_columns* are converted to
-        strings and, if not already present, added as field ``columns`` to *open_options*.
-        """
-        if not isinstance(source, str):
-            raise Exception(f"'{source}' cannot be opened as awkward_parquet")
-
-        # default open options
-        open_options = open_options or {}
-
-        # inject read_columns
-        if read_columns and "columns" not in open_options:
-            filter_name = [Route(s).string_column for s in read_columns]
-            open_options["columns"] = filter_name
-
-        # load the array wrapper
-        reader = DaskArrayReader(source, open_options)
-
-        return (reader, len(reader))
-
-    @classmethod
-    def close_dask_awkward_parquet(
-        cls,
-        source_object: DaskArrayReader,
-    ) -> None:
-        """
-        Closes the dask array wrapper referred to by *source_object*.
-        """
-        source_object.close()
-
-    @classmethod
-    def read_dask_awkward_parquet(
-        cls,
-        source_object: DaskArrayReader,
-        chunk_pos: ChunkedIOHandler.ChunkPosition,
-        read_options: dict | None = None,
-        read_columns: set[str | Route] | None = None,
-    ) -> ak.Array:
-        """
-        Given a :py:class:`DaskArrayReader` *source_object*, returns the chunk referred to by
-        *chunk_pos* as a full copy loaded into memory. Passing neither *read_options* nor
-        *read_columns* has an effect.
-        """
         # get the materialized ak array for that chunk
         return source_object.materialize(
             chunk_index=chunk_pos.index,
@@ -4111,22 +3963,27 @@ class ChunkedIOHandler(object):
         )
 
     @property
+    def n_entries(self) -> int | None:
+        # backwards compatibility
+        return self.n_entries_filtered
+
+    @property
     def n_chunks(self) -> int:
         """
         Returns the number of chunks this instance will iterate over based on the number of entries
-        :py:attr:`n_entries` and the configured :py:attr:`chunk_size`. In case :py:attr:`n_entries`
+        :py:attr:`n_entries_filtered` and the configured :py:attr:`chunk_size`. In case :py:attr:`n_entries_filtered`
         was not initialzed yet (via :py:meth:`open`), an *AttributeError* is raised.
         """
-        if self.n_entries is None:
+        if self.n_entries_filtered is None:
             raise AttributeError("cannot determine number of chunks before open()")
-        return int(math.ceil(self.n_entries / self.chunk_size))
+        return int(math.ceil(self.n_entries_filtered / self.chunk_size))
 
     @property
     def closed(self) -> bool:
         """
         Returns whether the instance is closed for reading.
         """
-        return len(self.source_objects) != self.n_sources
+        return not self.n_sources or len(self.source_objects) != self.n_sources
 
     def open(self) -> None:
         """
@@ -4139,30 +3996,56 @@ class ChunkedIOHandler(object):
 
         # reset some attributes
         del self.source_objects[:]
-        self.n_entries = None
+        del self.chunk_positions[:]
+        self.n_entries_total = None
+        self.n_entries_filtered = None
 
         # open all sources and make sure they have the same number of entries
-        for i, (source, source_handler, open_options, read_columns) in enumerate(zip(
+        for source_index, (source, source_handler, open_options, read_columns, filter_config) in enumerate(zip(
             self.source_list,
             self.source_handlers,
             self.open_options_list,
             self.read_columns_list,
+            self.filter_config_list,
         )):
             # open the source
-            obj, n = source_handler.open(
+            obj, n_total, filter_mask = source_handler.open(
                 source,
                 open_options=open_options,
                 read_columns=(sorted(read_columns) if read_columns else read_columns),
+                filter_config=filter_config,
             )
+            if filter_mask is None:
+                n_filtered = n_total
+            else:
+                filter_mask = np.asarray(filter_mask, dtype=bool)
+                n_filtered = int(filter_mask.sum())
+
             # check entries
-            if i == 0:
-                self.n_entries = n
-            elif n != self.n_entries:
+            if source_index == 0:
+                self.n_entries_total = n_total
+                self.n_entries_filtered = n_filtered
+            elif n_filtered != self.n_entries_filtered:
+                filter_str = "" if self.n_entries_filtered == self.n_entries_total else "(filtered) "
                 raise ValueError(
-                    f"number of entries of source {i} '{source}' does not match first source",
+                    f"number of {filter_str}entries of source {source_index} '{source}' ({n_filtered:_}) does not "
+                    f"match that of source 0 '{self.source_list[0]}' ({self.n_entries_filtered:_})",
                 )
+
             # save the source object
             self.source_objects.append(obj)
+
+            # compute chunk positions for that source
+            filter_indices = None if filter_mask is None else np.where(filter_mask)[0]
+            self.chunk_positions.append([
+                self.create_chunk_position(
+                    n_entries=self.n_entries_total,
+                    chunk_size=self.chunk_size,
+                    chunk_index=chunk_index,
+                    filter_mask=filter_indices,
+                )
+                for chunk_index in range(max(self.n_chunks, 1))
+            ])
 
             logger_perf.debug(f"opening {source} of type {source_handler.type} for reading")
 
@@ -4179,8 +4062,11 @@ class ChunkedIOHandler(object):
         for (obj, source_handler) in zip(self.source_objects, self.source_handlers):
             source_handler.close(obj)
 
-        # delete the file cache
+        # clear some attributes
         del self.source_objects[:]
+        del self.chunk_positions[:]
+        self.n_entries_total = None
+        self.n_entries_filtered = None
 
     def queue(self, *args, **kwargs) -> None:
         """
@@ -4197,6 +4083,14 @@ class ChunkedIOHandler(object):
         if self.closed:
             raise Exception(f"cannot iterate through closed {self.__class__.__name__}")
 
+        # check that all chunk position lists have the same length
+        for source_index, chunk_positions in enumerate(self.chunk_positions):
+            if len(chunk_positions) != self.n_chunks:
+                raise Exception(
+                    f"found {len(chunk_positions)} chunk position(s) for source {source_index}, but expected "
+                    f"{self.n_chunks}",
+                )
+
         # create a list of read functions
         read_funcs = [
             partial(
@@ -4204,42 +4098,49 @@ class ChunkedIOHandler(object):
                 obj,
                 read_options=read_options,
                 read_columns=(sorted(read_columns) if read_columns else read_columns),
+                filter_config=filter_config,
             )
-            for obj, source_handler, read_options, read_columns in zip(
+            for obj, source_handler, read_options, read_columns, filter_config in zip(
                 self.source_objects,
                 self.source_handlers,
                 self.read_options_list,
                 self.read_columns_list,
+                self.filter_config_list,
             )
         ]
 
-        # lightweight callabe that wraps all read funcs and comines their return values
-        def read(chunk_pos):
+        # lightweight callabe that wraps all read funcs and combines their return values
+        def read(chunk_index: int) -> ChunkedIOHandler.ReadResult:
             chunks = []
             durations = []
             t1 = time.perf_counter()
-            for read_func in read_funcs:
-                chunks.append(read_func(chunk_pos))
+            chunk_size = None
+            for source_index, read_func in enumerate(read_funcs):
+                chunk = read_func(self.chunk_positions[source_index][chunk_index])
+                if source_index == 0:
+                    chunk_size = len(chunk)
+                elif len(chunk) != chunk_size:
+                    raise ValueError(
+                        f"number of entries in chunk {chunk_index} of source {source_index} ({len(chunk):_}) does not "
+                        f"match that of source 0 ({chunk_size:_})",
+                    )
+                chunks.append(chunk)
                 durations.append(time.perf_counter() - t1)
 
             duration = law.util.human_duration(seconds=sum(durations))
             durations = [f"{s:.1f}" for s in durations]
             logger_perf.debug(
-                f"reading of chunk {chunk_pos.index} from {len(durations)} file(s) took {duration} "
+                f"reading of chunk {chunk_index} from {len(durations)} file(s) took {duration} "
                 f"({'+'.join(durations)}s)",
             )
 
+            # return a read result with the chunk position of the first source
+            chunk_pos = self.chunk_positions[0][chunk_index]
             return self.ReadResult((chunks if self.is_multi else chunks[0]), chunk_pos)
 
-        # create a list of all chunk positions
-        chunk_positions = [
-            self.create_chunk_position(self.n_entries, self.chunk_size, chunk_index)
-            for chunk_index in range(max(self.n_chunks, 1))
-        ]
-
         # fill the list of tasks the pool has to work through
-        for chunk_pos in chunk_positions:
-            self.task_queue.add(read, (chunk_pos,), priority=-1)
+        for chunk_index in range(self.n_chunks):
+            self.task_queue.add(read, (chunk_index,), priority=-1)
 
         # strategy: setup the pool and manually keep it filled up to pool_size and do not insert all
         # chunks right away as this could swamp the memory if processing is slower than IO

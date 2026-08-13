@@ -12,11 +12,13 @@ import os
 import io
 import re
 import abc
+import enum
 import uuid
 import queue
 import threading
 import subprocess
 import importlib
+import pathlib
 import fnmatch
 import inspect
 import pprint
@@ -29,7 +31,7 @@ import law
 import luigi
 
 from columnflow import env_is_dev, env_is_remote, docs_url, github_url
-from columnflow.types import Callable, Any, Sequence, Union, ModuleType, Type, T, Hashable
+from columnflow.types import Callable, Any, Sequence, Union, ModuleType, Type, T, Hashable, Protocol, runtime_checkable
 
 
 #: Placeholder for an unset value.
@@ -361,7 +363,7 @@ def ensure_proxy(
             return None
 
         # do nothing when explicitly skipped by the law config
-        if law.config.get_expanded_boolean("analysis", "skip_ensure_proxy", False):
+        if law.config.get_expanded_bool("analysis", "skip_ensure_proxy", False):
             return None
 
         # check the proxy validity
@@ -512,19 +514,19 @@ def maybe_int(i: Any) -> Any:
     return i
 
 
-def is_pattern(s: str) -> bool:
-    """
-    Returns *True* if a string *s* contains pattern characters such as "*" or "?", and *False* otherwise.
-    """
-    return "*" in s or "?" in s or s.startswith("!")
-
-
 def is_regex(s: str) -> bool:
     """
-    Returns *True* if a string *s* is a regular expression starting with "^" and ending with "$",
-    and *False* otherwise.
+    Returns *True* if a string *s* is a regular expression containing both "^" and "$", and *False* otherwise.
     """
-    return s.startswith("^") and s.endswith("$")
+    return "^" in s and "$" in s
+
+
+def is_pattern(s: str) -> bool:
+    """
+    Returns *True* if a string *s* is not a regular expression (see :py:func:`is_regex`) and contains pattern characters
+    such as "*" or "?", and *False* otherwise.
+    """
+    return not is_regex(s) and ("*" in s or "?" in s)
 
 
 def pattern_matcher(pattern: Sequence[str] | str, mode: Callable = any) -> Callable[[str], bool]:
@@ -533,8 +535,8 @@ def pattern_matcher(pattern: Sequence[str] | str, mode: Callable = any) -> Calla
     or just a plain string and returns a function that can be used to test of a string matches that
     pattern.
 
-    Patterns starting with "^" and ending with "$" are considered regular expressions, and otherwise fnmatch patterns.
-    In the latter case, when the pattern starts with a "!", the match is inverted.
+    Patterns containing both "^" and "$" are considered regular expressions, and otherwise fnmatch patterns.
+    When the pattern starts with a "!", the match is inverted.
 
     When *pattern* is a sequence, all its patterns are compared the same way and the result is the
     combination given a *mode* which typically should be *any* or *all*.
@@ -564,13 +566,18 @@ def pattern_matcher(pattern: Sequence[str] | str, mode: Callable = any) -> Calla
         matcher("123bar")     # -> False
         matcher("foo123bar")  # -> True
     """
-    if isinstance(pattern, (list, tuple, set)):
+    if isinstance(pattern, (list, tuple, set)) or law.util.is_lazy_iterable(pattern):
         matchers = [pattern_matcher(p) for p in pattern]
         return lambda s: mode(matcher(s) for matcher in matchers)
 
     # special cases
     if pattern in ["*", "^.*$"]:
         return lambda s: True
+
+    negate = pattern.startswith("!")
+    if negate:
+        matcher = pattern_matcher(pattern[1:], mode=mode)
+        return lambda s: not matcher(s)
 
     # identify regular expressions
     if is_regex(pattern):
@@ -579,9 +586,6 @@ def pattern_matcher(pattern: Sequence[str] | str, mode: Callable = any) -> Calla
 
     # identify fnmatch patterns
     if is_pattern(pattern):
-        negate = pattern.startswith("!")
-        if negate:
-            return lambda s: not fnmatch.fnmatch(s, pattern[1:])
         return lambda s: fnmatch.fnmatch(s, pattern)
 
     # fallback to string comparison
@@ -617,6 +621,15 @@ def get_source_code(obj: Any, indent: str | int = None) -> str:
         )
 
     return code
+
+
+class StrEnum(enum.Enum):
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}.{self.value}>"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class DotDict(OrderedDict):
@@ -1027,6 +1040,78 @@ class KeyValueMessage(luigi.worker.SchedulerMessage):
         return str(self.value)
 
 
+@runtime_checkable
+class CacheBase(Protocol):
+
+    def has(self, key: Hashable) -> bool:
+        ...
+
+    def get(self, key: Hashable) -> Any:
+        ...
+
+    def set(self, key: Hashable, value: Any) -> None:
+        ...
+
+
+class PersistentCache(CacheBase):
+
+    def __init__(self, cache_path: str | pathlib.Path | law.FileSystemFileTarget) -> None:
+        super().__init__()
+
+        self.cache_target = (
+            cache_path
+            if isinstance(cache_path, law.FileSystemFileTarget)
+            else law.LocalFileTarget(cache_path)
+        )
+
+        # state
+        self.cache: dict[Hashable, Any] = {}
+        self.opened: bool = False
+        self.modified: bool = False
+
+    def __enter__(self) -> PersistentCache:
+        return self.open()
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def open(self) -> PersistentCache:
+        if self.opened:
+            raise Exception(f"{self.__class__.__name__} is already opened")
+
+        # when existing, overwrite cache in memory with that from file
+        self.cache.clear()
+        if self.cache_target.exists():
+            self.cache |= self.cache_target.load(formatter="json")
+
+        self.modified = False
+        self.opened = True
+
+        return self
+
+    def close(self) -> None:
+        if not self.opened:
+            raise Exception(f"{self.__class__.__name__} is not opened")
+
+        # write to file when modified
+        if self.modified:
+            self.cache_target.dump(self.cache, formatter="json", indent=2)
+
+        self.modified = False
+        self.opened = False
+
+    def has(self, key: Hashable) -> bool:
+        return key in self.cache
+
+    def get(self, key: Hashable) -> Any:
+        return self.cache[key]
+
+    def set(self, key: Hashable, value: Any) -> None:
+        if not self.modified and (not self.has(key) or self.get(key) != value):
+            self.modified = True
+        self.cache[key] = value
+
+
 def load_correction_set(target: law.FileSystemFileTarget | str) -> Any:
     """
     Loads a correction set using the correctionlib from a file *target*.
@@ -1038,7 +1123,7 @@ def load_correction_set(target: law.FileSystemFileTarget | str) -> Any:
 
     # convert str to target
     if isinstance(target, str):
-        target = law.LocalFileTarget(target)
+        target = law.LocalFileTarget(os.path.abspath(target))
 
     # use the path when the input file is a normal json
     if target.ext() == "json":

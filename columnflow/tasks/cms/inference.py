@@ -15,6 +15,7 @@ from columnflow.tasks.framework.base import AnalysisTask, wrapper_factory
 from columnflow.tasks.framework.inference import SerializeInferenceModelBase
 from columnflow.tasks.histograms import MergeHistograms
 from columnflow.inference.cms.datacard import DatacardWriter
+from columnflow.hist_util import select_category_bins
 from columnflow.types import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -89,7 +90,11 @@ class CreateDatacards(SerializeInferenceModelBase):
                 if not any(d.variable == variable for d in cat_obj.config_data.values()):
                     continue
                 # cross check that all configs use the same variable (should already be guarded by the model validation)
-                assert all(d.variable == variable for d in cat_obj.config_data.values())
+                if not all(d.variable == variable for d in cat_obj.config_data.values()):
+                    raise ValueError(
+                        f"datacard category '{cat_obj.name}' uses different variables for its configs: "
+                        f"{[d.variable for d in cat_obj.config_data.values()]}",
+                    )
 
                 # check which configs contribute to this category
                 config_insts = [
@@ -113,10 +118,7 @@ class CreateDatacards(SerializeInferenceModelBase):
                 datacard_hists: DatacardHists = {cat_obj.name: {}}
                 for config_inst in _input_hists.keys():
                     config_data = cat_obj.config_data.get(config_inst.name)
-
-                    # determine leaf categories to gather
                     category_inst = config_inst.get_category(category)
-                    leaf_category_insts = category_inst.get_leaf_categories() or [category_inst]
 
                     # eagerly remove data histograms in case data is supposed to be faked from mc processes
                     if cat_obj.data_from_processes:
@@ -159,14 +161,13 @@ class CreateDatacards(SerializeInferenceModelBase):
                             continue
 
                         # select relevant categories
-                        h_proc = h_proc[{
-                            "category": [
-                                hist.loc(c.name)
-                                for c in leaf_category_insts
-                                if c.name in h_proc.axes["category"]
-                            ],
-                        }]
-                        h_proc = h_proc[{"category": sum}]
+                        h_proc = select_category_bins(
+                            h_proc,
+                            category_inst,
+                            use_leaves=True,
+                            prefer_parents=True,
+                            reduce=True,
+                        )
 
                         # create the nominal hist
                         datacard_hists[cat_obj.name].setdefault(proc_obj.name, {}).setdefault(config_inst.name, {})

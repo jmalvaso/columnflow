@@ -6,18 +6,27 @@ Tools for producing new array columns (e.g. high-level variables).
 
 from __future__ import annotations
 
+import copy
 import inspect
 
 import law
 
-from columnflow.util import DerivableMeta
 from columnflow.columnar_util import TaskArrayFunction
-from columnflow.types import Callable, Sequence, Any
+from columnflow.util import DerivableMeta, UNSET
+from columnflow.types import Callable, Sequence, Any, UNSET_TYPE
 
 
 class TaskArrayFunctionWithProducerRequirements(TaskArrayFunction):
 
     require_producers: Sequence[str] | set[str] | None = None
+
+    def __init__(self, *args, **kwargs):
+        if "require_producers" in kwargs or self.__class__.require_producers is None:
+            kwargs["require_producers"] = kwargs.get("require_producers") or []
+        elif isinstance(self.__class__.require_producers, (list, tuple)):
+            kwargs["require_producers"] = copy.copy(self.__class__.require_producers)
+
+        super().__init__(*args, **kwargs)
 
     def _req_producer(self, task: law.Task, producer: str) -> Any:
         # hook to customize how required producers are requested
@@ -25,13 +34,18 @@ class TaskArrayFunctionWithProducerRequirements(TaskArrayFunction):
         return ProduceColumns.req_other_producer(task, producer=producer)
 
     def requires_func(self, task: law.Task, reqs: dict, **kwargs) -> None:
+        super().requires_func(task=task, reqs=reqs, **kwargs)
+
         # no requirements for workflows in pilot mode
         if callable(getattr(task, "is_workflow", None)) and task.is_workflow() and getattr(task, "pilot", False):
             return
 
         # add required producers when set
         if (prods := self.require_producers):
-            reqs["required_producers"] = {prod: self._req_producer(task, prod) for prod in prods}
+            reqs["required_producers"] = {
+                prod: self._req_producer(task, prod)
+                for prod in law.util.make_unique(prods)
+            }
 
     def setup_func(
         self,
@@ -41,6 +55,8 @@ class TaskArrayFunctionWithProducerRequirements(TaskArrayFunction):
         reader_targets: law.util.InsertableDict,
         **kwargs,
     ) -> None:
+        super().setup_func(task=task, reqs=reqs, inputs=inputs, reader_targets=reader_targets, **kwargs)
+
         if "required_producers" in inputs:
             for prod, inp in inputs["required_producers"].items():
                 reader_targets[f"required_producer_{prod}"] = inp["columns"]
@@ -62,9 +78,9 @@ class Producer(TaskArrayFunctionWithProducerRequirements):
         cls,
         func: Callable | None = None,
         bases: tuple = (),
-        mc_only: bool = False,
-        data_only: bool = False,
-        require_producers: Sequence[str] | set[str] | None = None,
+        mc_only: bool | UNSET_TYPE = UNSET,
+        data_only: bool | UNSET_TYPE = UNSET,
+        require_producers: Sequence[str] | set[str] | None | UNSET_TYPE = UNSET,
         **kwargs,
     ) -> DerivableMeta | Callable:
         """
@@ -89,13 +105,13 @@ class Producer(TaskArrayFunctionWithProducerRequirements):
         """
         def decorator(func: Callable) -> DerivableMeta:
             # create the class dict
-            cls_dict = {
-                **kwargs,
-                "call_func": func,
-                "mc_only": mc_only,
-                "data_only": data_only,
-                "require_producers": require_producers,
-            }
+            cls_dict = {**kwargs, "call_func": func}
+            if mc_only is not UNSET:
+                cls_dict["mc_only"] = mc_only
+            if data_only is not UNSET:
+                cls_dict["data_only"] = data_only
+            if require_producers is not UNSET:
+                cls_dict["require_producers"] = require_producers
 
             # get the module name
             frame = inspect.stack()[1]
@@ -114,8 +130,7 @@ class Producer(TaskArrayFunctionWithProducerRequirements):
                     raise Exception(f"producer {cls_name} received both mc_only and data_only")
                 if (mc_only or data_only) and cls_dict.get("skip_func"):
                     raise Exception(
-                        f"producer {cls_name} received custom skip_func, but either mc_only or "
-                        "data_only are set",
+                        f"producer {cls_name} received custom skip_func, but either mc_only or data_only are set",
                     )
 
                 if "skip_func" not in cls_dict:

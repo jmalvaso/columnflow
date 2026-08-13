@@ -18,6 +18,7 @@ from columnflow.tasks.framework.mixins import (
 )
 from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.histograms import MergeHistograms
+from columnflow.hist_util import select_category_bins
 from columnflow.util import dev_sandbox, try_int
 
 
@@ -135,6 +136,7 @@ class CreateYieldTable(_CreateYieldTable):
     def run(self):
         import hist
         from tabulate import tabulate
+        from columnflow.plotting.plot_util import remove_label_placeholders
 
         inputs = self.input()
         outputs = self.output()
@@ -200,14 +202,7 @@ class CreateYieldTable(_CreateYieldTable):
                 processes.append(process_inst)
 
                 for category_inst in category_insts:
-                    leaf_category_insts = category_inst.get_leaf_categories() or [category_inst]
-
-                    h_cat = h[{"category": [
-                        hist.loc(c.name)
-                        for c in leaf_category_insts
-                        if c.name in h.axes["category"]
-                    ]}]
-                    h_cat = h_cat[{"category": sum}]
+                    h_cat = select_category_bins(h, category_inst, use_leaves=True, prefer_parents=True, reduce=True)
 
                     value = Number(h_cat.value)
                     if not self.skip_uncertainties:
@@ -237,7 +232,7 @@ class CreateYieldTable(_CreateYieldTable):
                 }
 
             # initialize dicts
-            yields_str = defaultdict(list, {"Process": [proc.label for proc in processes]})
+            yields_str = defaultdict(list, {"Process": [remove_label_placeholders(proc.label) for proc in processes]})
             raw_yields = defaultdict(dict, {})
 
             # apply normalization and format
@@ -262,7 +257,7 @@ class CreateYieldTable(_CreateYieldTable):
                     )
                     if "latex" in self.table_format:
                         yield_str = f"${yield_str}$"
-                    yields_str[category.label].append(yield_str)
+                    yields_str[remove_label_placeholders(category.label)].append(yield_str)
 
             # create, print and save the yield table
             yield_table = tabulate(yields_str, headers="keys", tablefmt=self.table_format)

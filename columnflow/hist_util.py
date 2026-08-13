@@ -9,12 +9,14 @@ from __future__ import annotations
 __all__ = []
 
 import functools
+import operator
+
 import law
 import order as od
 
 from columnflow.columnar_util import flat_np_view, layout_ak_array
 from columnflow.util import maybe_import
-from columnflow.types import TYPE_CHECKING, Any, Sequence
+from columnflow.types import TYPE_CHECKING, Any, Sequence, Callable
 
 np = maybe_import("numpy")
 ak = maybe_import("awkward")
@@ -93,20 +95,62 @@ def fill_hist(
 
     # actual conversion
     if convert:
-        arrays = ak.flatten(ak.cartesian(data))
-        data = {field: arrays[field] for field in arrays.fields}
-        del arrays
+        # in case there is more than one variable axis that will be filled with data with ndim > 1, we need to build
+        # object level combinations
+        var_axes = [
+            ax for ax in h.axes
+            if isinstance(ax, (hist.axis.Variable, hist.axis.Integer)) and ax.name in data and data[ax.name].ndim > 1
+        ]
+        if len(var_axes) > 1:
+            # build pairwise combinations of obj level variables
+            combi_key = "cf_hist_fill_obj_lvl_combinations"
+            data[combi_key] = ak.zip({ax.name: data.pop(ax.name) for ax in var_axes})
+
+            # build event level combinations of all remaining axes
+            arrays = ak.cartesian(data)
+
+            # unpack entries of the object level combinations
+            unpacked_dict = {}
+            for field in arrays.fields:
+                if field == combi_key:
+                    for ax in var_axes:
+                        unpacked_dict[ax.name] = arrays[field][ax.name]
+                else:
+                    unpacked_dict[field] = arrays[field]
+            unpacked_arrays = ak.zip(unpacked_dict)
+            # flatten
+            data = {field: ak.flatten(unpacked_arrays[field]) for field in unpacked_arrays.fields}
+            del arrays, unpacked_arrays, unpacked_dict
+
+        else:
+            # strings cannot be handled yet in the cartesian product
+            for ax_name, value in data.items():
+                if isinstance(value, str):
+                    raise TypeError(
+                        "cannot perform cartesian product during histogram filling with string data for axis "
+                        f"'{ax_name}': '{value}'",
+                    )
+            arrays = ak.flatten(ak.cartesian(data))
+            data = {field: arrays[field] for field in arrays.fields}
+            del arrays
 
     # fill
-    h.fill(**fill_kwargs, **data)
+    try:
+        h.fill(**fill_kwargs, **data)
+    except MemoryError as e:
+        msg = f"error while filling histogram\n{h!r}\nwith data {data}\nand kwargs {fill_kwargs}"
+        raise MemoryError(msg) from e
 
 
-def add_hist_axis(histogram: hist.Hist, variable_inst: od.Variable) -> hist.Hist:
+def add_hist_axis(
+    h: hist.quick_construct.QuickConstruct,
+    variable_inst: od.Variable,
+) -> hist.quick_construct.QuickConstruct:
     """
     Add an axis to a histogram based on a variable instance. The axis_type is chosen based on the variable instance's
     "axis_type" auxiliary.
 
-    :param histogram: The histogram to add the axis to.
+    :param h: The histogram to add the axis to.
     :param variable_inst: The variable instance to use for the axis.
     :return: The histogram with the added axis.
     """
@@ -126,17 +170,17 @@ def add_hist_axis(histogram: hist.Hist, variable_inst: od.Variable) -> hist.Hist
     axis_type = variable_inst.x("axis_type", default_axis_type).lower()
 
     if axis_type in {"variable", "var"}:
-        return histogram.Var(variable_inst.bin_edges, **axis_kwargs)
+        return h.Variable(variable_inst.bin_edges, **axis_kwargs)
 
     if axis_type in {"integer", "int"}:
-        return histogram.Integer(
+        return h.Integer(
             int(variable_inst.bin_edges[0]),
             int(variable_inst.bin_edges[-1]),
             **axis_kwargs,
         )
 
     if axis_type in {"boolean", "bool"}:
-        return histogram.Boolean(**axis_kwargs)
+        return h.Boolean(**axis_kwargs)
 
     if axis_type in {"intcategory", "intcat"}:
         binning = (
@@ -145,16 +189,16 @@ def add_hist_axis(histogram: hist.Hist, variable_inst: od.Variable) -> hist.Hist
             else []
         )
         axis_kwargs.setdefault("growth", True)
-        return histogram.IntCat(binning, **axis_kwargs)
+        return h.IntCategory(binning, **axis_kwargs)
 
     if axis_type in {"strcategory", "strcat"}:
         axis_kwargs.setdefault("growth", True)
-        return histogram.StrCat([], **axis_kwargs)
+        return h.StrCategory([], **axis_kwargs)
 
     if axis_type in {"regular", "reg"}:
         if not variable_inst.even_binning:
             logger.warning("regular axis with uneven binning is not supported, using first and last bin edge instead")
-        return histogram.Regular(
+        return h.Regular(
             variable_inst.n_bins,
             variable_inst.bin_edges[0],
             variable_inst.bin_edges[-1],
@@ -219,7 +263,7 @@ def copy_axis(axis: hist.axis.AxesMixin, **kwargs: dict[str, Any]) -> hist.axis.
 
 def create_hist_from_variables(
     *variable_insts,
-    categorical_axes: tuple[tuple[str, str]] | None = None,
+    categorical_axes: Sequence[tuple[str, str] | tuple[str, str, list[str]]] | None = None,
     weight: bool = True,
     storage: str | None = None,
 ) -> hist.Hist:
@@ -229,11 +273,12 @@ def create_hist_from_variables(
 
     # additional category axes
     if categorical_axes:
-        for name, axis_type in categorical_axes:
+        for tpl in categorical_axes:
+            name, axis_type, axis_values = (tpl + ([],))[:3]
             if axis_type in ("intcategory", "intcat"):
-                histogram = histogram.IntCat([], name=name, growth=True)
+                histogram = histogram.IntCat(axis_values, name=name, growth=True)
             elif axis_type in ("strcategory", "strcat"):
-                histogram = histogram.StrCat([], name=name, growth=True)
+                histogram = histogram.StrCat(axis_values, name=name, growth=True)
             else:
                 raise ValueError(f"unknown axis type '{axis_type}' in argument 'categorical_axes'")
 
@@ -247,35 +292,32 @@ def create_hist_from_variables(
         storage = "weight" if weight else "double"
     else:
         storage = storage.lower()
+
+    # actual creation
     if storage == "weight":
-        histogram = histogram.Weight()
+        h = histogram.Weight()
     elif storage == "double":
-        histogram = histogram.Double()
+        h = histogram.Double()
     else:
         raise ValueError(f"unknown storage type '{storage}'")
 
-    return histogram
-
-
-create_columnflow_hist = functools.partial(create_hist_from_variables, categorical_axes=(
-    # axes that are used in columnflow tasks per default
-    # (NOTE: "category" axis is filled as int, but transformed to str afterwards)
-    ("category", "intcat"),
-    ("process", "intcat"),
-    ("shift", "strcat"),
-))
+    return h
 
 
 def translate_hist_intcat_to_strcat(
     h: hist.Hist,
     axis_name: str,
-    id_map: dict[int, str],
+    id_map: Callable[[int], str] | dict[int, str],
 ) -> hist.Hist:
     import hist
 
+    # wrap id_map in a callable if it is given as a dict
+    if isinstance(id_map, dict):
+        id_map = functools.partial(operator.getitem, id_map)
+
     out_axes = [
         ax if ax.name != axis_name else hist.axis.StrCategory(
-            [id_map[v] for v in list(ax)],
+            [id_map(v) for v in list(ax)],
             name=ax.name,
             label=ax.label,
             growth=ax.traits.growth,
@@ -321,7 +363,7 @@ def update_ax_labels(hists: list[hist.Hist], config_inst: od.Config, variable_na
     :param hists: List of histograms to update.
     :param config_inst: Configuration instance containing variable definitions.
     :param variable_name: Name of the variable to update labels for, formatted as a string
-                         with variable names separated by hyphens (e.g., "var1-var2").
+                          with variable names separated by hyphens (e.g., "var1-var2").
     :raises ValueError: If a variable name is not found in the histogram axes.
     """
     labels = {}
@@ -371,3 +413,267 @@ def sum_hists(hists: Sequence[hist.Hist]) -> hist.Hist:
         h_sum = h_sum + (h if h_aligned_labels is None else h_aligned_labels)
 
     return h_sum
+
+
+def select_category_bins(
+    h: hist.Hist,
+    categories: od.Category | str | Sequence[od.Category | str],
+    use_leaves: bool = False,
+    prefer_parents: bool = False,
+    reduce: bool = False,
+) -> hist.Hist:
+    """
+    Given a histogram *h* that has a categorical "category" axis, this function selects bins on this axis according to
+    *categories*.
+
+    Depending on the types of the provided *categories*, the behavior can be more intricate. If *categories* are given
+    as strings, bins with matching names are selected with pattern support. If *categories* are
+    :py:class:`~order.Category` objects, the selection is similar (without pattern support). However, if *use_leaves* is
+    set to *True*, the selection is done based on the leaf categories of the provided *categories* instead. For
+    additional control in cases where the requested categories *and* their leaves might be present in this "category"
+    axis, *prefer_parents* can be altered to decide which of the two cases to prefer.
+
+    If *reduce* is set to *True*, the selected bins are summed before the resulting histogram is returned.
+
+    :param h: The histogram to select from. Must have a categorical "category" axis.
+    :param categories: The categories to select. Can be given as strings or :py:class:`~order.Category` objects.
+    :param use_leaves: Whether to select based on the leaf categories of the provided *categories* instead of the
+        provided *categories* themselves (if they are :py:class:`~order.Category` objects).
+    :param prefer_parents: Whether to prefer selection based on the provided *categories* themselves over their leaf
+        categories in cases where both are present in the "category" axis. Defaults to the value of *use_leaves*.
+    :param reduce: Whether to sum the selected bins before returning the resulting histogram.
+    :return: The resulting histogram.
+    """
+    import hist
+
+    # get the category axis
+    axis = h.axes["category"]
+
+    # obtain category names to select based on the provided types
+    categories = law.util.make_unique(law.util.make_list(categories))
+    if all(isinstance(c, str) for c in categories):
+        # interpret categories as sequence of patterns
+        selected_names = [name for name in axis if law.util.multi_match(name, categories, mode=any)]
+
+    elif all(isinstance(c, od.Category) for c in categories):
+        # categories are objects, so check leaf usage
+        if use_leaves:
+            selected_names = []
+            for c in categories:
+                if prefer_parents and c.name in axis:
+                    selected_names.append(c.name)
+                else:
+                    leaves = c.get_leaf_categories() or [c]
+                    selected_names.extend(l.name for l in leaves if l.name in axis)
+        else:
+            selected_names = [c.name for c in categories if c.name in axis]
+
+    else:
+        raise ValueError(f"categories must be given as all strings or od.Category objects, got {categories}")
+
+    # finally select and optionally reduce
+    h = h[{"category": [hist.loc(name) for name in selected_names]}]
+    if reduce:
+        h = h[{"category": sum}]
+
+    return h
+
+
+def ensure_bin_exists(
+    h: hist.Hist,
+    axis_name: str,
+    value: Any | Sequence[Any],
+    add_growth: bool = True,
+) -> hist.Hist:
+    """
+    Takes a histogram *h* and ensures that a certain *value* is a valid bin in a categorical axis
+    named *axis_name*. Optionally, *growth* can be activated on the selected axis.
+
+    :param h: The histogram.
+    :param axis_name: The name of the categorical axis to ammend.
+    :param value: The value for which a bin should be ensured on the axis.
+    :param add_growth: If growth should be enabled on the selected axis.
+    :return: The updated histogram.
+    """
+    import hist
+
+    # work on a copy
+    h = h.copy()
+
+    # find the axis and its index
+    for axis_index, axis in enumerate(h.axes):
+        if axis.name == axis_name:
+            break
+    else:
+        raise ValueError(f"no axis named '{axis_name}' found in histogram: {h}")
+
+    # for now, only adjustments to categorical axes are allowed
+    categorical_types = (hist.axis.IntCategory, hist.axis.StrCategory)
+    if not isinstance(axis, categorical_types):
+        raise TypeError(f"axis '{axis_name}' must be categorical, but found {axis.__class__.__name__}")
+
+    # helper to create advanced slice object using axis_index
+    def create_slice(where: Any) -> tuple:
+        return tuple(
+            axis_index * [slice(None, None)] +  # axes before target axis
+            [where] +  # last (= newest) position on amended axis
+            (h.ndim - axis_index - 1) * [slice(None, None)],  # remaining axes
+        )
+
+    # check that growth is enabled
+    if not axis.traits.growth:
+        if not add_growth:
+            raise ValueError(f"cannot extend values axis '{axis_name}' without growth enabled")
+        # enable growth
+        axis = copy_axis(axis, growth=True)
+        new_axes = [
+            (axis if ax.name == axis.name else copy_axis(ax))
+            for ax in h.axes
+        ]
+        # take the initial data but drop the overflow bin on the requested axis
+        # (which always exists on categorical axes that don't have growth enabled)
+        data = h.view(flow=True)[create_slice(slice(0, -1))]
+        h = hist.Hist(*new_axes, storage=h.storage_type(), data=data)
+
+    # extend for all values if a sequence is given
+    for _value in law.util.make_list(value):
+        # nothing to do in case the value already exists
+        if _value in axis:
+            continue
+
+        # strategy: fill dummy values, then zero them in view afterwards
+        # get bin centers of first bin in other axes
+        dummy_values = {
+            ax.name: (list(ax)[0] if isinstance(ax, categorical_types) else ax.centers[0])
+            for ax in h.axes if ax != axis
+        }
+        h.fill(**(dummy_values | {axis_name: _value}))
+        # now zero array
+        view = h.view()
+        zero_pos = create_slice(-1)
+        if isinstance(h.storage_type(), (hist.storage.Weight, hist.storage.WeightedMean)):
+            view.value[zero_pos] = 0
+            view.variance[zero_pos] = 0
+        else:
+            view[zero_pos] = 0
+
+    return h
+
+
+def merge_axis_bins(
+    h: hist.Hist,
+    axis_name: str,
+    merged_bin_name: str,
+    bins_to_merge: Sequence[str],
+    remove_bins: bool = True,
+) -> hist.Hist:
+    """
+    This function merges categorical bins given in *bins_to_merge* onto the bin *merged_bin_name*.
+
+        - If *merged_bin_name* does not exist yet in *axis_name*, it is initialized with empty content.
+        - If *merged_bin_name* exists, it must be included in *bins_to_merge* to avoid merging into an existing bin.
+
+    :param h: The histogram.
+    :param axis_name: The name of the categorical axis to ammend.
+    :param merged_bin_name: The name of the merged bin which is optionally created.
+    :param bins_to_merge: The bins to merge and subsequently remove.
+    :param remove_bins: Optionally remove bins in *bins_to_merge* after merging.
+    :return: The updated histogram.
+    """
+    import hist
+
+    # sanity checks
+    for bin_name in bins_to_merge:
+        if bin_name not in h.axes[axis_name]:
+            raise ValueError(f"bin '{bin_name}' not found in axis '{axis_name}'")
+
+    if merged_bin_name in h.axes[axis_name] and merged_bin_name not in bins_to_merge:
+        raise ValueError(
+            f"bin '{merged_bin_name}' already exists but is not found in bins to be merged '{bins_to_merge}', "
+            "leading to unclear bin content handling",
+        )
+
+    # ensure merged_bin_name exists in axis, it may or may not be already filled
+    h = ensure_bin_exists(h, axis_name, merged_bin_name)
+
+    # add up bin contents
+    for bin_name in bins_to_merge:
+        # avoid double counting in case merged_bin_name is also in bins_to_merge
+        if bin_name != merged_bin_name:
+            h[{axis_name: merged_bin_name}] += h[{axis_name: bin_name}]
+
+    # remove unneeded bins
+    if remove_bins:
+        bins_to_remove = set(bins_to_merge) - {merged_bin_name}
+        h = h[{
+            axis_name: [
+                hist.loc(bin_name) for bin_name in h.axes[axis_name]
+                if bin_name not in bins_to_remove
+            ],
+        }]
+
+    return h
+
+
+def insert_axis_values(
+    h: hist.Hist,
+    axis_name: str,
+    axis_value: Any,
+    values: np.ndarray | hist.Hist,
+    variances: np.ndarray | None = None,
+    flow: bool | None = None,
+) -> None:
+    """
+    Inserts (in-place) values and optionally variances into a histogram *h* for a given *axis_name* and *axis_value*.
+
+    :param h: The histogram to insert values into.
+    :param axis_name: The name of the axis to insert values for.
+    :param axis_value: The value of the axis to insert values for.
+    :param values: The values to insert. Can be an array or a histogram.
+    :param variances: The variances to insert. If *None* and *values* is a histogram, its variances are used.
+        Otherwise, no variances are inserted.
+    :param flow: Whether to use flow bins when inserting values. If *True*, the length of inserted values should fit
+        accordingly. When *None*, the default is *True* in case *values* is a histogram and *False* otherwise.
+    """
+    import hist
+
+    # if values is a histogram, extract actual values and variances
+    hist_has_variances = "variance" in h.view().dtype.names
+    if isinstance(values, hist.Hist):
+        if flow is None:
+            flow = True
+        if variances is None and hist_has_variances:
+            variances = values.view(flow=flow).variance
+        values = values.view(flow=flow).value
+    elif flow is None:
+        flow = False
+
+    # check if variances are provided and can be inserted
+    if variances is not None and not hist_has_variances:
+        raise ValueError("histogram does not store variances (weights), but variances were provided for insertion")
+
+    # get the axis and it's index
+    axis_names = [ax.name for ax in h.axes]
+    if axis_name not in axis_names:
+        raise ValueError(f"axis '{axis_name}' not found in histogram axes {axis_names}")
+    axis = h.axes[axis_name]
+    axis_index = axis_names.index(axis_name)
+
+    # get the value and its index
+    axis_values = list(axis)
+    if axis_value not in axis_values:
+        raise ValueError(f"axis value '{axis_value}' not found in axis '{axis_name}'")
+    value_index = axis_values.index(axis_value)
+
+    # create slice object using axis_index and value_index
+    insert_at = tuple(
+        axis_index * [slice(None, None)] +  # axes before target axis
+        [value_index] +  # last (= newest) position on amended axis
+        (len(axis_names) - axis_index - 1) * [slice(None, None)],  # remaining axes
+    )
+
+    # insert values
+    view = h.view(flow=flow)
+    view.value[insert_at] = values
+    if variances is not None:
+        view.variance[insert_at] = variances

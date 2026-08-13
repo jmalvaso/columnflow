@@ -6,6 +6,8 @@ Default histogram producers that define columnflow's default behavior.
 
 from __future__ import annotations
 
+import functools
+
 import law
 import order as od
 
@@ -39,27 +41,55 @@ def cf_default_create_hist(
     self: HistProducer,
     variables: list[od.Variable],
     task: law.Task,
-    **kwargs,
 ) -> hist.Hist:
     """
     Define the histogram structure for the default histogram producer.
     """
     return create_hist_from_variables(
         *variables,
-        categorical_axes=(
+        categorical_axes=[
             ("category", "intcat"),
             ("process", "intcat"),
-            ("shift", "intcat"),
-        ),
+            ("shift", "intcat", [0]),
+        ],
         weight=True,
     )
 
 
 @cf_default.fill_hist
-def cf_default_fill_hist(self: HistProducer, h: hist.Hist, data: dict[str, Any], task: law.Task) -> None:
+def cf_default_fill_hist(
+    self: HistProducer,
+    h: hist.Hist,
+    data: dict[str, Any],
+    variables: list[od.Variable],
+    events: ak.Array,
+    task: law.Task,
+) -> None:
     """
     Fill the histogram with the data.
     """
+    # in case multiple variable axes are given that refer to data arrays with more than one dimension (i.e. nested),
+    # check if they are broadcasting-compatible since otherwise, the full combinatorics of values would be filled which
+    # is not supported by fill_hist in its default implementation
+    import hist
+
+    var_axes = [
+        ax for ax in h.axes
+        if isinstance(ax, (hist.axis.Variable, hist.axis.Integer)) and ax.name in data and data[ax.name].ndim > 1
+    ]
+    if len(var_axes) > 1:
+        ref_counts = ak.count(data[var_axes[0].name], axis=1)
+        for ax in var_axes[1:]:
+            counts = ak.count(data[ax.name], axis=1)
+            if not ak.all(counts == ref_counts):
+                err = (
+                    "detected multiple variable axes with data to be filled that is not broadcasting-compatible:\n" +
+                    "\n  - ".join(f"{ax.name}: {data[ax.name]}" for ax in var_axes) +
+                    "please use a custom histogram producer whose fill_hist implementation supports the desired "
+                    "filling logic including combinatorics or custom broadcasting"
+                )
+                raise ValueError(err)
+
     fill_hist(h, data, last_edge_inclusive=task.last_edge_inclusive)
 
 
@@ -73,14 +103,20 @@ def cf_default_post_process_hist(self: HistProducer, h: hist.Hist, task: law.Tas
 
     # translate axes
     if "category" in axis_names:
-        category_map = {cat.id: cat.name for cat in self.config_inst.get_leaf_categories()}
-        h = translate_hist_intcat_to_strcat(h, "category", category_map)
+        @functools.cache
+        def get_category_name(cat_id: int) -> str:
+            return self.config_inst.get_category(cat_id).name
+        h = translate_hist_intcat_to_strcat(h, "category", get_category_name)
     if "process" in axis_names:
-        process_map = {proc_id: self.config_inst.get_process(proc_id).name for proc_id in h.axes["process"]}
-        h = translate_hist_intcat_to_strcat(h, "process", process_map)
+        @functools.cache
+        def get_process_name(process_id: int) -> str:
+            return self.config_inst.get_process(process_id).name
+        h = translate_hist_intcat_to_strcat(h, "process", get_process_name)
     if "shift" in axis_names:
-        shift_map = {task.global_shift_inst.id: task.global_shift_inst.name}
-        h = translate_hist_intcat_to_strcat(h, "shift", shift_map)
+        @functools.cache
+        def get_shift_name(shift_id: int) -> str:
+            return self.config_inst.get_shift(shift_id).name
+        h = translate_hist_intcat_to_strcat(h, "shift", get_shift_name)
 
     return h
 
@@ -132,7 +168,9 @@ def all_weights(self: HistProducer, events: ak.Array, **kwargs) -> ak.Array:
 
 
 @all_weights.init
-def all_weights_init(self: HistProducer) -> None:
+def all_weights_init(self: HistProducer, **kwargs) -> None:
+    super(all_weights, self).init_func(**kwargs)
+
     weight_columns = set()
 
     if self.dataset_inst.is_data:

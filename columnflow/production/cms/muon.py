@@ -56,6 +56,8 @@ class MuonSFConfig:
     # name of the saved weight column
     weight_name="muon_weight",
     supported_versions={1, 2},
+    # function to update variables before corrector call
+    update_corrector_variables=(lambda self, corrector, variables: variables),
 )
 def muon_weights(
     self: Producer,
@@ -112,12 +114,17 @@ def muon_weights(
         ("systdown", "_down"),
     ]:
         # get the inputs for this type of variation
-        variable_map_syst = {
+        _variable_map = {
             **variable_map,
-            "scale_factors": "nominal" if syst == "sf" else syst,  # syst key in 2022
-            "ValType": syst,  # syst key in 2017
+            "scale_factors": "nominal" if syst == "sf" else syst,
+            "ValType": syst,
         }
-        inputs = [variable_map_syst[inp.name] for inp in self.muon_sf_corrector.inputs]
+
+        # optionally update variables for this corrector call
+        if callable(self.update_corrector_variables):
+            _variable_map = self.update_corrector_variables(self.muon_sf_corrector, _variable_map)
+
+        inputs = [_variable_map[inp.name] for inp in self.muon_sf_corrector.inputs]
         sf = self.muon_sf_corrector.evaluate(*inputs)
 
         # create the product over all muons in one event
@@ -131,6 +138,8 @@ def muon_weights(
 
 @muon_weights.init
 def muon_weights_init(self: Producer, **kwargs) -> None:
+    super(muon_weights, self).init_func(**kwargs)
+
     # add the product of nominal and up/down variations to produced columns
     self.produces.add(f"{self.weight_name}{{,_up,_down}}")
 
@@ -142,6 +151,8 @@ def muon_weights_requires(
     reqs: dict[str, DotDict[str, Any]],
     **kwargs,
 ) -> None:
+    super(muon_weights, self).requires_func(task=task, reqs=reqs, **kwargs)
+
     if "external_files" in reqs:
         return
 
@@ -158,6 +169,8 @@ def muon_weights_setup(
     reader_targets: law.util.InsertableDict,
     **kwargs,
 ) -> None:
+    super(muon_weights, self).setup_func(task=task, reqs=reqs, inputs=inputs, reader_targets=reader_targets, **kwargs)
+
     bundle = reqs["external_files"]
 
     # load the corrector

@@ -52,18 +52,6 @@ class TopPtWeightFromTheoryConfig:
     })
 
 
-# for backward compatibility
-class TopPtWeightConfig(TopPtWeightFromDataConfig):
-
-    def __init__(self, *args, **kwargs):
-        logger.warning_once(
-            "TopPtWeightConfig is deprecated and will be removed in future versions, please use "
-            "TopPtWeightFromDataConfig instead to keep using the data-based method, or TopPtWeightFromTheoryConfig to "
-            "use the theory-based method",
-        )
-        super().__init__(*args, **kwargs)
-
-
 @producer(
     uses={"gen_top.t.pt"},
     produces={"top_pt_weight{,_up,_down}"},
@@ -127,7 +115,9 @@ def top_pt_weight(self: Producer, events: ak.Array, **kwargs) -> ak.Array:
 
 
 @top_pt_weight.init
-def top_pt_weight_init(self: Producer) -> None:
+def top_pt_weight_init(self: Producer, **kwargs) -> None:
+    super(top_pt_weight, self).init_func(**kwargs)
+
     # store the top pt weight config
     self.cfg = self.get_top_pt_weight_config()
     if not isinstance(self.cfg, (TopPtWeightFromDataConfig, TopPtWeightFromTheoryConfig)):

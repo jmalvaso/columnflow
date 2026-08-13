@@ -12,9 +12,10 @@ import law
 import order as od
 
 from columnflow.production import TaskArrayFunctionWithProducerRequirements
-from columnflow.util import DerivableMeta, maybe_import
-from columnflow.types import TYPE_CHECKING, Any, Callable, Sequence
+from columnflow.util import DerivableMeta, maybe_import, UNSET
+from columnflow.types import TYPE_CHECKING, Any, Callable, Sequence, UNSET_TYPE
 
+ak = maybe_import("awkward")
 if TYPE_CHECKING:
     hist = maybe_import("hist")
 
@@ -47,15 +48,26 @@ class HistProducer(TaskArrayFunctionWithProducerRequirements):
         type: callable
 
         The registered function for performing an optional post-processing of histograms after they are merged.
+
+    .. py:attribute:: post_process_compatibility_check
+
+        type: bool
+
+        Whether to perform a compatibility check of the histogram after post-processing. Default is *True*.
+
+    .. py:attribute:: post_process_merged_compatibility_check
+
+        type: bool
+
+        Whether to perform a compatibility check of the histogram after post-processing of merged histograms. Default is
+        *False*.
     """
 
-    # class-level attributes as defaults
-    create_hist_func = None
-    fill_hist_func = None
-    post_process_hist_func = None
-    post_process_merged_hist_func = None
-    skip_compatibility_check = False
     exposed = True
+
+    # class-level attributes as defaults
+    post_process_compatibility_check: bool = True
+    post_process_merged_compatibility_check: bool = False
 
     # register attributes for arguments accepted by decorator
     mc_only: bool = False
@@ -66,9 +78,9 @@ class HistProducer(TaskArrayFunctionWithProducerRequirements):
         cls,
         func: Callable | None = None,
         bases: tuple = (),
-        mc_only: bool = False,
-        data_only: bool = False,
-        require_producers: Sequence[str] | set[str] | None = None,
+        mc_only: bool | UNSET_TYPE = UNSET,
+        data_only: bool | UNSET_TYPE = UNSET,
+        require_producers: Sequence[str] | set[str] | None | UNSET_TYPE = UNSET,
         **kwargs,
     ) -> DerivableMeta | Callable:
         """
@@ -92,13 +104,13 @@ class HistProducer(TaskArrayFunctionWithProducerRequirements):
         """
         def decorator(func: Callable) -> DerivableMeta:
             # create the class dict
-            cls_dict = {
-                **kwargs,
-                "call_func": func,
-                "mc_only": mc_only,
-                "data_only": data_only,
-                "require_producers": require_producers,
-            }
+            cls_dict = {**kwargs, "call_func": func}
+            if mc_only is not UNSET:
+                cls_dict["mc_only"] = mc_only
+            if data_only is not UNSET:
+                cls_dict["data_only"] = data_only
+            if require_producers is not UNSET:
+                cls_dict["require_producers"] = require_producers
 
             # get the module name
             frame = inspect.stack()[1]
@@ -119,8 +131,8 @@ class HistProducer(TaskArrayFunctionWithProducerRequirements):
                 if mc_only or data_only:
                     if cls_dict.get("skip_func"):
                         raise Exception(
-                            f"hist producer {cls_name} received custom skip_func, but either mc_only or data_only "
-                            "are set",
+                            f"hist producer {cls_name} received custom skip_func, but either mc_only or data_only are "
+                            "set",
                         )
 
                 if "skip_func" not in cls_dict:
@@ -169,6 +181,8 @@ class HistProducer(TaskArrayFunctionWithProducerRequirements):
 
             - *h*, the histogram (or a container with histograms) to fill.
             - *data*, a dictionary with data to fill.
+            - *variables*, a list of :py:class:`order.Variable` instances (often just one).
+            - *events*, initial event data.
             - *task*, the invoking task instance.
 
         The decorator does not return the wrapped function.
@@ -237,30 +251,64 @@ class HistProducer(TaskArrayFunctionWithProducerRequirements):
         """
         Invokes the :py:meth:`create_hist_func` of this instance and returns its result, forwarding all arguments.
         """
-        return self.create_hist_func(variables, task=task)
+        return self.create_hist_func(variables=variables, task=task)
 
-    def run_fill_hist(self, h: Any, data: dict[str, Any], task: law.Task) -> None:
+    def create_hist_func(self, variables: list[od.Variable], task: law.Task) -> Any:
+        """
+        Default create_hist function.
+        """
+        raise NotImplementedError
+
+    def run_fill_hist(
+        self,
+        h: Any,
+        data: dict[str, Any],
+        variables: list[od.Variable],
+        events: ak.Array,
+        task: law.Task,
+    ) -> None:
         """
         Invokes the :py:meth:`fill_hist_func` of this instance and returns its result, forwarding all arguments.
         """
-        return self.fill_hist_func(h, data, task=task)
+        return self.fill_hist_func(h=h, data=data, variables=variables, events=events, task=task)
+
+    def fill_hist_func(
+        self,
+        h: Any,
+        data: dict[str, Any],
+        variables: list[od.Variable],
+        events: ak.Array,
+        task: law.Task,
+    ) -> None:
+        """
+        Default fill_hist function.
+        """
+        raise NotImplementedError
 
     def run_post_process_hist(self, h: Any, task: law.Task) -> Any:
         """
         Invokes the :py:meth:`post_process_hist_func` of this instance and returns its result, forwarding all arguments.
         """
-        if not callable(self.post_process_hist_func):
-            return h
-        return self.post_process_hist_func(h, task=task)
+        return self.post_process_hist_func(h=h, task=task)
+
+    def post_process_hist_func(self, h: Any, task: law.Task) -> Any:
+        """
+        Default post_process_hist function.
+        """
+        return h
 
     def run_post_process_merged_hist(self, h: Any, task: law.Task) -> hist.Hist:
         """
         Invokes the :py:meth:`post_process_merged_hist_func` of this instance and returns its result, forwarding all
         arguments.
         """
-        if not callable(self.post_process_merged_hist_func):
-            return h
-        return self.post_process_merged_hist_func(h, task=task)
+        return self.post_process_merged_hist_func(h=h, task=task)
+
+    def post_process_merged_hist_func(self, h: Any, task: law.Task) -> hist.Hist:
+        """
+        Default post_process_merged_hist function.
+        """
+        return h
 
 
 # shorthand

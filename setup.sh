@@ -37,6 +37,8 @@ setup_columnflow() {
     #       serves as a default for e.g. $CF_SOFTWARE_BASE, $CF_CMSSW_BASE, $CF_JOB_BASE and
     #       $CF_VENV_BASE which can, however, potentially point to a different directory. Queried
     #       during the interactive setup.
+    #   CF_PYTHON_VERSION
+    #       The python version to use for the conda and venv installations. Defaults to "3.9".
     #   CF_SOFTWARE_BASE
     #       The directory where general software is installed. Might point to $CF_DATA/software.
     #       Queried during the interactive setup.
@@ -275,8 +277,22 @@ cf_setup_common_variables() {
         export LC_ALL="${LC_ALL:-en_US.UTF-8}"
     fi
 
-    # proxy
+    # variables for external tools and libraries
+    export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
+    export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+    export GLOBUS_THREAD_MODEL="${GLOBUS_THREAD_MODEL:-none}"
+    export VIRTUAL_ENV_DISABLE_PROMPT="${VIRTUAL_ENV_DISABLE_PROMPT:-1}"
+    export MYPROXY_SERVER="${MYPROXY_SERVER:-myproxy.cern.ch}"
     export X509_USER_PROXY="${X509_USER_PROXY:-/tmp/x509up_u$( id -u )}"
+    export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
+    export X509_VOMS_DIR="${X509_VOMS_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/vomsdir}"
+    export X509_VOMSES="${X509_VOMSES:-/cvmfs/grid.cern.ch/etc/grid-security/vomses}"
+    export VOMS_USERCONF="${VOMS_USERCONF:-${X509_VOMSES}}"
+    ulimit -s unlimited
+    if [ "${CF_FLAVOR}" = "cms" ]; then
+        export RUCIO_ACCOUNT="${RUCIO_ACCOUNT:-${CF_CERN_USER}}"
+        export RUCIO_HOME="${RUCIO_HOME:-"/cvmfs/cms.cern.ch/rucio/x86_64/rhel9/py3/current"}"
+    fi
 
     # overwrite some variables in remote and ci jobs
     if ${CF_REMOTE_ENV}; then
@@ -310,15 +326,17 @@ cf_setup_common_variables() {
     export CF_SLURM_FLAVOR="${CF_SLURM_FLAVOR:-${cf_slurm_flavor_default}}"
     export CF_SLURM_PARTITION="${CF_SLURM_PARTITION:-${cf_slurm_partition_default}}"
 
+    # notification variables
+    export CF_MATTERMOST_HOOK_URL="${CF_MATTERMOST_HOOK_URL:-}"
+    export CF_MATTERMOST_CHANNEL="${CF_MATTERMOST_CHANNEL:-}"
+
     # show a warning in case no CF_REPO_BASE_ALIAS is set
     if [ -z "${CF_REPO_BASE_ALIAS}" ]; then
         cf_color yellow "the variable CF_REPO_BASE_ALIAS is unset"
         cf_color yellow "please consider setting it to the name of the variable that refers to your analysis base directory"
     fi
 
-    # notification variables
-    export CF_MATTERMOST_HOOK_URL="${CF_MATTERMOST_HOOK_URL:-}"
-    export CF_MATTERMOST_CHANNEL="${CF_MATTERMOST_CHANNEL:-}"
+    return "0"
 }
 
 cf_show_banner() {
@@ -376,7 +394,7 @@ cf_setup_interactive_common_variables() {
     query CF_VENV_SETUP_MODE_UPDATE "Automatically update virtual envs if needed" "false"
     [ "${CF_VENV_SETUP_MODE_UPDATE}" != "true" ] && export_and_save CF_VENV_SETUP_MODE "update"
     unset CF_VENV_SETUP_MODE_UPDATE
-    query CF_INTERACTIVE_VENV_FILE "Custom venv setup fill to use for interactive work instead of 'cf_dev'" "" "''"
+    query CF_INTERACTIVE_VENV_FILE "Custom venv setup file to use for interactive work instead of 'cf_dev'" "" "''"
 
     query CF_LOCAL_SCHEDULER "Use a local scheduler for law tasks" "true"
     if [ "${CF_LOCAL_SCHEDULER}" != "true" ]; then
@@ -529,6 +547,8 @@ cf_setup_software_stack() {
     #       The base directory were virtual envs are installed.
     #
     # Optional environments variables:
+    #   CF_PYTHON_VERSION
+    #       The python version for the conda and venv installations. Defaults to "3.9".
     #   CF_REMOTE_ENV
     #       When true-ish, the software stack is sourced but not built.
     #   CF_LOCAL_ENV
@@ -562,7 +582,6 @@ cf_setup_software_stack() {
     local setup_name="${1}"
     local setup_is_default="false"
     [ "${setup_name}" = "default" ] && setup_is_default="true"
-    local pyv="${CF_PYTHON_VERSION:-3.9}"
     local conda_arch="${CF_CONDA_ARCH:-linux-64}"
     local ret
 
@@ -572,13 +591,16 @@ cf_setup_software_stack() {
         setopt globdots
     fi
 
+    # default python version
+    export CF_PYTHON_VERSION="${CF_PYTHON_VERSION:-3.9}"
+
     # empty the PYTHONPATH, except for specific customizable paths
     export PYTHONPATH="${CF_INITIAL_PYTHONPATH:-}"
 
     # persistent PATH and PYTHONPATH parts that should be
     # priotized over any additions made in sandboxes
     export CF_PERSISTENT_PATH="${CF_BASE}/bin:${CF_BASE}/modules/law/bin"
-    export CF_PERSISTENT_PYTHONPATH="${CF_BASE}:${CF_BASE}/bin:${CF_BASE}/modules/law:${CF_BASE}/modules/order"
+    export CF_PERSISTENT_PYTHONPATH="${CF_BASE}:${CF_BASE}/bin:${CF_BASE}/modules/law/src:${CF_BASE}/modules/order"
 
     # flavor specific paths
     if [ ! -z "${CF_FLAVOR}" ]; then
@@ -590,22 +612,12 @@ cf_setup_software_stack() {
     export PYTHONPATH="${CF_PERSISTENT_PYTHONPATH}:${PYTHONPATH}"
 
     # also add the python path of the venv to be installed to propagate changes to any outer venv
-    export CF_CONDA_PYTHONPATH="${CF_CONDA_BASE}/lib/python${pyv}/site-packages"
+    export CF_CONDA_PYTHONPATH="${CF_CONDA_BASE}/lib/python${CF_PYTHON_VERSION}/site-packages"
     export PYTHONPATH="${PYTHONPATH}:${CF_CONDA_PYTHONPATH}"
 
-    # update paths and flags
+    # update mamba variables
     export MAMBA_ROOT_PREFIX="${CF_CONDA_BASE}"
     export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
-    export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"
-    export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
-    export GLOBUS_THREAD_MODEL="${GLOBUS_THREAD_MODEL:-none}"
-    export VIRTUAL_ENV_DISABLE_PROMPT="${VIRTUAL_ENV_DISABLE_PROMPT:-1}"
-    export MYPROXY_SERVER="${MYPROXY_SERVER:-myproxy.cern.ch}"
-    export X509_CERT_DIR="${X509_CERT_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/certificates}"
-    export X509_VOMS_DIR="${X509_VOMS_DIR:-/cvmfs/grid.cern.ch/etc/grid-security/vomsdir}"
-    export X509_VOMSES="${X509_VOMSES:-/cvmfs/grid.cern.ch/etc/grid-security/vomses}"
-    export VOMS_USERCONF="${VOMS_USERCONF:-${X509_VOMSES}}"
-    ulimit -s unlimited
 
     #
     # setup in local envs (not remote)
@@ -655,23 +667,27 @@ EOF
             # initialize micromamba
             source "${CF_CONDA_BASE}/etc/profile.d/micromamba.sh" "" || return "$?"
             micromamba activate || return "$?"
-            echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${pyv}" )"
+            echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${CF_PYTHON_VERSION}" )"
 
             # install packages
+            # some versions pinned, see https://github.com/columnflow/columnflow/issues/816
             if ${conda_missing}; then
                 echo
                 cf_color cyan "setting up conda / micromamba environment"
                 micromamba install \
                     gcc \
                     libgcc \
+                    gxx \
+                    libstdcxx-ng \
                     bash \
                     zsh \
-                    "python=${pyv}" \
+                    "python=${CF_PYTHON_VERSION}" \
                     git \
                     git-lfs \
-                    gfal2 \
+                    "gfal2=2.23.1" \
                     gfal2-util \
-                    python-gfal2 \
+                    "python-gfal2=1.13.0" \
+                    "xrootd=5.8.4" \
                     myproxy \
                     conda-pack \
                     || return "$?"
@@ -770,7 +786,7 @@ EOF
         # initialize conda
         source "${CF_CONDA_BASE}/etc/profile.d/micromamba.sh" "" || return "$?"
         micromamba activate || return "$?"
-        echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${pyv}" )"
+        echo "initialized conda with $( cf_color magenta "micromamba" ) interface and $( cf_color magenta "python ${CF_PYTHON_VERSION}" )"
 
         # source the production sandbox
         source "${CF_BASE}/sandboxes/cf.sh" "" "no"
@@ -886,6 +902,7 @@ cf_check_tmp_dir() {
 
     return "0"
 }
+[ ! -z "${BASH_VERSION}" ] && export -f cf_check_tmp_dir
 
 cf_setup_git_hooks() {
     # Initializes lfs and custom githooks in the local checkout for both the columnflow
@@ -1032,7 +1049,7 @@ cf_init_submodule() {
 cf_cast_bool() {
     # lower case
     local value="$( cf_lower_case "$1" )"
-    if [ "${value}" = "1" ] || [ "${value}" = "yes" ] || [ "${value}" = "true" ]; then
+    if [ "${value}" = "1" ] || [ "${value}" = "yes" ] || [ "${value}" = "y" ] || [ "${value}" = "true" ]; then
         echo "true"
     else
         echo "false"
@@ -1123,11 +1140,13 @@ cf_lower_case() {
     # cross-shell lower case helper
     echo "$1" | tr "[:upper:]" "[:lower:]"
 }
+[ ! -z "${BASH_VERSION}" ] && export -f cf_lower_case
 
 cf_upper_case() {
     # cross-shell upper case helper
     echo "$1" | tr "[:lower:]" "[:upper:]"
 }
+[ ! -z "${BASH_VERSION}" ] && export -f cf_upper_case
 
 main() {
     # Invokes the main action of this script, catches possible error codes and prints a message.
