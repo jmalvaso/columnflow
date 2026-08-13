@@ -267,16 +267,11 @@ class PlotBase(ConfigTask):
         for key, value in general_settings.items():
             kwargs.setdefault(key, value)
 
-        # start building the style config with custom adjustments when a dictionary is given
-        style_config = kwargs.get("style_config") or {}
-        if not isinstance(style_config, dict):
-            self.logger.warning("style_config passed to update_plot_kwargs is not a dictionary, ignoring custom styles")
-        else:
-            # resolve custom_style_config
-            custom_style_config = kwargs.get("custom_style_config")
-            if custom_style_config in {RESOLVE_DEFAULT, (RESOLVE_DEFAULT,)}:
-                custom_style_config = config_inst.x("default_custom_style_config", ())
-            custom_style_config = law.util.make_tuple(custom_style_config) if custom_style_config else ()
+        # resolve custom_style_config
+        custom_style_config = kwargs.get("custom_style_config", None)
+        if custom_style_config == RESOLVE_DEFAULT:
+            # custom_style_config = config_inst.x("default_custom_style_config", RESOLVE_DEFAULT)
+            custom_style_config = config_inst.x("default_custom_style_config", ())
 
             # loop over custom styles, look them up in the config, and merge them into style_config
             groups = config_inst.x("custom_style_config_groups", {})
