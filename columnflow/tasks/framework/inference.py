@@ -262,6 +262,32 @@ class SerializeInferenceModelBase(_SerializeInferenceModelBase):
             return set(expander(set(variables)))
 
         return set(variables)
+    def get_hist_requirement_producers(
+        self,
+        variables: set[str],
+    ) -> tuple[str, ...]:
+        """
+        Allow inference models to customize the producer set
+        used for histogram requirements.
+        """
+
+        producers = tuple(self.producers)
+
+        resolver = getattr(
+            self.inference_model_inst,
+            "get_hist_requirement_producers",
+            None,
+        )
+
+        if callable(resolver):
+            return tuple(
+                resolver(
+                    set(variables),
+                    producers,
+                )
+            )
+
+        return producers
     def requires_histograms(self, **kwargs):
         # gather data from inference model to define requirements in the structure
         # config_name -> dataset_name -> MergeHistogramsTask
@@ -269,7 +295,19 @@ class SerializeInferenceModelBase(_SerializeInferenceModelBase):
         for config_inst, data in self.combined_config_data.items():
             reqs[config_inst.name] = {}
 
-            hist_variables = self.get_hist_requirement_variables(data["variables"])
+            model_variables = set(data["variables"])
+
+            hist_variables = (
+                self.get_hist_requirement_variables(
+                    model_variables
+                )
+            )
+
+            hist_producers = (
+                self.get_hist_requirement_producers(
+                    model_variables
+                )
+            )
 
             # ensure that all variables exist
             for var_name in set.union(*map(set, map(VariablesMixin.split_multi_variable, hist_variables))):
@@ -286,6 +324,7 @@ class SerializeInferenceModelBase(_SerializeInferenceModelBase):
                     dataset=dataset_name,
                     shift_sources=("nominal",) + tuple(sorted(data["mc_datasets"][dataset_name]["shift_sources"])),
                     variables=hist_variables,
+                    producers=hist_producers,
                     **kwargs,
                 )
 
@@ -296,6 +335,7 @@ class SerializeInferenceModelBase(_SerializeInferenceModelBase):
                     dataset=dataset_name,
                     shift_sources=("nominal",),
                     variables=hist_variables,
+                    producers=hist_producers,
                     **kwargs,
                 )
 
