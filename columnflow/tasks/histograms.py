@@ -36,8 +36,41 @@ class VariablesMixinWorkflow(
     RemoteWorkflow,
 ):
 
+    @classmethod
+    def resolve_param_values_pre_init(
+        cls,
+        params,
+    ):
+        params = super().resolve_param_values_pre_init(
+            params
+        )
+
+        container = cls._get_config_container(params)
+
+        if container is not None:
+            expander = container.x(
+                "histogram_variable_expander",
+                None,
+            )
+
+            if callable(expander):
+                variables = params.get(
+                    "variables",
+                    (),
+                )
+
+                if variables:
+                    params["variables"] = tuple(
+                        expander(variables)
+                    )
+
+        return params
+
     def control_output_postfix(self) -> str:
-        return f"{super().control_output_postfix()}__vars_{self.variables_repr}"
+        return (
+            f"{super().control_output_postfix()}"
+            f"__vars_{self.variables_repr}"
+        )
 
 
 class _CreateHistograms(
@@ -546,7 +579,7 @@ class MergeShiftedHistograms(_MergeShiftedHistograms):
         reqs = super().workflow_requires()
 
         # add nominal and both directions per shift source
-        for shift_name in expand_shift_sources(self.shift_sources):
+        for shift_name in (self.get_required_histogram_shifts(self.shift_sources)):
             reqs[shift_name] = self.pilot_workflow_requires(self.reqs.MergeHistograms.req(
                 self,
                 shift=shift_name,
@@ -556,9 +589,18 @@ class MergeShiftedHistograms(_MergeShiftedHistograms):
         return reqs
 
     def requires(self):
+
         return {
-            shift_name: self.reqs.MergeHistograms.req(self, shift=shift_name, _prefer_cli={"variables"})
-            for shift_name in expand_shift_sources(self.branch_data)
+            shift_name:
+                self.reqs.MergeHistograms.req(
+                    self,
+                    shift=shift_name,
+                    _prefer_cli={"variables"},
+                )
+            for shift_name
+            in self.get_required_histogram_shifts(
+                self.branch_data
+            )
         }
 
     def store_parts(self) -> law.util.InsertableDict:
@@ -569,7 +611,46 @@ class MergeShiftedHistograms(_MergeShiftedHistograms):
             parts["shift_sources"] = f"shifts__{shifts_repr}"
 
         return parts
+    def get_embedded_weight_shift_sources(self) -> set[str]:
 
+        return set(
+            self.config_inst.x(
+                "histogram_weight_shift_sources",
+                (),
+            )
+        )
+
+
+    def get_required_histogram_shifts(self,shift_sources) -> tuple[str, ...]:
+
+        embedded_sources = (
+            self.get_embedded_weight_shift_sources()
+        )
+
+        # Weight-only sources are already contained
+        # inside the nominal histogram.
+        external_sources = [
+            source
+            for source in shift_sources
+            if (
+                source == "nominal"
+                or source not in embedded_sources
+            )
+        ]
+
+        # The nominal histogram is always required,
+        # since it also contains embedded weight shifts.
+        if "nominal" not in external_sources:
+            external_sources.insert(
+                0,
+                "nominal",
+            )
+
+        return tuple(
+            expand_shift_sources(
+                external_sources
+            )
+        )
     def output(self):
         return {
             "hists": law.SiblingFileCollection({

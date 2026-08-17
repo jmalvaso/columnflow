@@ -288,6 +288,28 @@ class SerializeInferenceModelBase(_SerializeInferenceModelBase):
             )
 
         return producers
+    def get_hist_requirement_variables_for_dataset(
+        self,
+        variables: set[str],
+        dataset_inst: od.Dataset,
+    ) -> set[str]:
+
+        resolver = getattr(
+            self.inference_model_inst,
+            "get_hist_requirement_variables_for_dataset",
+            None,
+        )
+
+        if callable(resolver):
+            return set(
+                resolver(
+                    set(variables),
+                    dataset_inst,
+                )
+            )
+
+        return self.get_hist_requirement_variables(variables)
+    
     def requires_histograms(self, **kwargs):
         # gather data from inference model to define requirements in the structure
         # config_name -> dataset_name -> MergeHistogramsTask
@@ -319,15 +341,19 @@ class SerializeInferenceModelBase(_SerializeInferenceModelBase):
             hist_variables = tuple(sorted(hist_variables))
             # mc datasets
             for dataset_name in sorted(data["mc_datasets"]):
-                reqs[config_inst.name][dataset_name] = self.requires_histogram(
-                    config=config_inst.name,
-                    dataset=dataset_name,
-                    shift_sources=("nominal",) + tuple(sorted(data["mc_datasets"][dataset_name]["shift_sources"])),
-                    variables=hist_variables,
-                    producers=hist_producers,
-                    **kwargs,
+                dataset_inst = (config_inst.get_dataset(dataset_name))
+                hist_variables = (self.get_hist_requirement_variables_for_dataset(model_variables,dataset_inst,))
+                hist_variables = tuple(sorted(hist_variables))
+                reqs[config_inst.name][dataset_name] = (
+                    self.requires_histogram(
+                        config=config_inst.name,
+                        dataset=dataset_name,
+                        shift_sources=(("nominal",)+ tuple(sorted(data["mc_datasets"][dataset_name]["shift_sources"]))),
+                        variables=hist_variables,
+                        producers=hist_producers,
+                        **kwargs,\
+                    )
                 )
-
             # data datasets, no shift sources so not chunked
             for dataset_name in sorted(data["data_datasets"]):
                 reqs[config_inst.name][dataset_name] = self.requires_histogram(
