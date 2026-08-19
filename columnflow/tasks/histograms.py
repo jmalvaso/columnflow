@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import luigi
 import law
+import inspect
 
 from columnflow.tasks.framework.base import Requirements, AnalysisTask, wrapper_factory
 from columnflow.tasks.framework.mixins import (
@@ -25,6 +26,7 @@ from columnflow.hist_util import update_ax_labels, sum_hists
 from columnflow.config_util import expand_shift_sources
 from columnflow.util import maybe_import, dev_sandbox
 from columnflow.types import TYPE_CHECKING
+
 
 if TYPE_CHECKING:
     hist = maybe_import("hist")
@@ -45,27 +47,55 @@ class VariablesMixinWorkflow(
             params
         )
 
-        container = cls._get_config_container(params)
+        container = cls._get_config_container(
+            params
+        )
 
         if container is not None:
+
             expander = container.x(
                 "histogram_variable_expander",
                 None,
             )
 
             if callable(expander):
+
                 variables = params.get(
                     "variables",
                     (),
                 )
 
                 if variables:
-                    params["variables"] = tuple(
-                        expander(variables)
+
+                    signature = inspect.signature(
+                        expander
+                    )
+
+                    expander_kwargs = {}
+
+                    if (
+                        "dataset"
+                        in signature.parameters
+                    ):
+
+                        expander_kwargs[
+                            "dataset"
+                        ] = params.get(
+                            "dataset",
+                            None,
+                        )
+
+                    params[
+                        "variables"
+                    ] = tuple(
+                        expander(
+                            variables,
+                            **expander_kwargs,
+                        )
                     )
 
         return params
-
+    
     def control_output_postfix(self) -> str:
         return (
             f"{super().control_output_postfix()}"
