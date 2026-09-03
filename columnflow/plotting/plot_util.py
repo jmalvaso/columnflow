@@ -528,6 +528,7 @@ def prepare_stack_plot_config(
     shift_insts: Sequence[od.Shift] | None = None,
     shape_norm: bool | None = False,
     hide_stat_errors: bool = False,
+     hide_data: bool = False,
     merge_stat_errors: bool = False,
     show_syst_rate_change: bool = False,
     ratio_mark_out_of_range: bool = True,
@@ -689,7 +690,7 @@ def prepare_stack_plot_config(
         }
 
     # draw data
-    if data_hists:
+    if data_hists and not hide_data:
         data_norm = shape_norm_func(h_data, shape_norm)
         plot_config["data"] = plot_cfg = {
             "method": "draw_errorbars",
