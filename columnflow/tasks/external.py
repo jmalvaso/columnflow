@@ -306,8 +306,13 @@ class GetDatasetLFNs(DatasetTask, law.tasks.TransferLocalFile):
                             f"name: {rse}",
                         )
                 if report_val:
-                    law.cms.rucio_report_access(lfn, rse=rse)
-
+                    try:
+                        law.cms.rucio_report_access(lfn, rse=rse)
+                    except Exception as e:
+                        logger.warning(
+                            f"Rucio access reporting failed for {lfn}: {e}. "
+                            "Continuing without access reporting."
+                        )
             yield (lfn_index, input_file)
 
     def _fetch_lfn_fallback(
