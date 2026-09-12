@@ -285,7 +285,33 @@ ReduceEventsWrapper = wrapper_factory(
     require_cls=ReduceEvents,
     enable=["configs", "skip_configs", "datasets", "skip_datasets", "shifts", "skip_shifts"],
 )
+def _get_reduce_file_merging_factor(task) -> int:
+    """
+    Return the number of original dataset files handled by one
+    ReduceEvents branch.
+    """
+    n_files = task.dataset_info_inst.n_files
+    file_merging = ReduceEvents.file_merging
 
+    if isinstance(file_merging, int):
+        if file_merging < 0:
+            raise ValueError(f"invalid ReduceEvents.file_merging value {file_merging}")
+
+        # file_merging == 0 means merge the full dataset into one branch
+        return n_files if file_merging == 0 else file_merging
+
+    # None means one original file per branch
+    return 1
+
+
+def _get_n_reduced_files(task) -> int:
+    """
+    Return the number of ReduceEvents output branches.
+    """
+    n_files = task.dataset_info_inst.n_files
+    file_merging = _get_reduce_file_merging_factor(task)
+
+    return math.ceil(n_files / file_merging)
 
 class _MergeReductionStats(
     CalibratorsMixin,
@@ -340,10 +366,11 @@ class MergeReductionStats(_MergeReductionStats):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        # cap n_inputs
-        n_merged_files = self.n_merged_files
-        if self.n_inputs < 0 or self.n_inputs > n_merged_files:
-            self.n_inputs = n_merged_files
+        # cap n_inputs to the actual number of ReduceEvents outputs
+        n_reduced_files = _get_n_reduced_files(self)
+
+        if self.n_inputs < 0 or self.n_inputs > n_reduced_files:
+            self.n_inputs = n_reduced_files
 
     def create_branch_map(self):
         # single branch without payload
@@ -419,8 +446,10 @@ class MergeReductionStats(_MergeReductionStats):
         stats["max_size_merged"] = self.merged_size * 1024**2  # MB to bytes
 
         # determine the number of files after merging, allowing a possible ~15% increase per file
-        # TODO: merging: check n_files usage
-        n_total = self.dataset_info_inst.n_files
+        # ReduceEvents already performs the first file-merging step.
+        # Therefore, estimate the second merging step from the number
+        # of ReduceEvents output files, not from the original NanoAOD count.
+        n_total = _get_n_reduced_files(self)
         if n_total > 1:
             # get the expected number of files after merging
             n_merged_files = n_total / n * stats["tot_size"] / stats["max_size_merged"]
@@ -506,17 +535,29 @@ class MergeReducedEvents(_MergeReducedEvents):
 
     @workflow_condition.create_branch_map
     def create_branch_map(self):
-        # forward to super class (DatasetTask)
-        return super().create_branch_map()
+        # MergeReducedEvents acts on ReduceEvents outputs, not directly
+        # on the original NanoAOD files.
+        n_files = _get_n_reduced_files(self)
+        n_merge = self.file_merging
+
+        chunks = law.util.iter_chunks(n_files,n_merge,)
+
+        return dict(enumerate(chunks))
 
     def workflow_requires(self):
         reqs = super().workflow_requires()
-        reqs["stats"] = self.reqs.MergeReductionStats.req_different_branching(self)
+
+        reqs["stats"] = self.reqs.MergeReductionStats.req_different_branching(
+            self,
+        )
+
+        n_reduced_files = _get_n_reduced_files(self)
+
         reqs["events"] = self.reqs.ReduceEvents.req_different_branching(
             self,
-            # TODO: merging: check n_files usage
-            branches=((0, self.dataset_info_inst.n_files),),
+            branches=((0, n_reduced_files),),
         )
+
         return reqs
 
     def requires(self):
@@ -612,12 +653,14 @@ class ProvideReducedEvents(_ProvideReducedEvents):
 
     @law.workflow_property(setter=True, cache=True, empty_value=0)
     def file_merging(self):
-        # TODO: merging: check n_files usage
-        if self.skip_merging or self.dataset_info_inst.n_files == 1:
+        if self.skip_merging or _get_n_reduced_files(self) == 1:
             return 1
 
-        # check if the merging stats are present
-        stats = self.reqs.MergeReductionStats.req_different_branching(self, branch=0).output()["stats"]
+        stats = self.reqs.MergeReductionStats.req_different_branching(
+            self,
+            branch=0,
+        ).output()["stats"]
+
         return stats.load(formatter="json")["merge_factor"] if stats.exists() else 0
 
     @law.dynamic_workflow_condition
@@ -641,7 +684,7 @@ class ProvideReducedEvents(_ProvideReducedEvents):
         # - when merging is forced, require it
         # - otherwise, and if the merging is already known, require either reduced or merged events
         # TODO: merging: check n_files usage
-        if self.skip_merging or (not self.force_merging and self.dataset_info_inst.n_files == 1):
+        if self.skip_merging or (not self.force_merging and _get_n_reduced_files(self) == 1):
             # reduced events are used directly without having to look into the file merging factor
             if not self.pilot:
                 reqs["events"] = self._req_reduced_events()
@@ -671,7 +714,7 @@ class ProvideReducedEvents(_ProvideReducedEvents):
         # same as for workflow requirements without optional pilot check
         reqs = DotDict()
         # TODO: merging: check n_files usage
-        if self.skip_merging or (not self.force_merging and self.dataset_info_inst.n_files == 1):
+        if self.skip_merging or (not self.force_merging and _get_n_reduced_files(self) == 1):
             reqs["events"] = self._req_reduced_events()
         else:
             reqs["reduction_stats"] = self.reqs.MergeReductionStats.req_different_branching(self, branch=0)
@@ -703,7 +746,7 @@ class ProvideReducedEvents(_ProvideReducedEvents):
     def _yield_dynamic_deps(self):
         # do nothing if a decision was pre-set in which case requirements were already triggered
         # TODO: merging: check n_files usage
-        if self.skip_merging or (not self.force_merging and self.dataset_info_inst.n_files == 1):
+        if self.skip_merging or (not self.force_merging and _get_n_reduced_files(self) == 1):
             return
 
         # yield the appropriate requirement
@@ -740,11 +783,40 @@ class ReducedEventsUser(
 
     @law.workflow_property(setter=True, cache=True, empty_value=0)
     def file_merging(self):
-        return self.reqs.ProvideReducedEvents.req(self).file_merging
+        provide_task = self.reqs.ProvideReducedEvents.req(self)
 
-    @law.dynamic_workflow_condition
-    def workflow_condition(self):
-        return self.reqs.ProvideReducedEvents.req(self).workflow_condition()
+        second_stage_merging = provide_task.file_merging
+
+        if second_stage_merging <= 0:
+            return second_stage_merging
+
+        first_stage_merging = _get_reduce_file_merging_factor(self)
+
+        return (
+            first_stage_merging
+            *
+            second_stage_merging
+        )
+
+    @workflow_condition.create_branch_map
+    def create_branch_map(self):
+        n_reduced_files = _get_n_reduced_files(self)
+
+        # When merging is skipped, ProvideReducedEvents maps one-to-one
+        # to ReduceEvents. Otherwise, it follows the second-stage
+        # MergeReducedEvents grouping.
+        n_merge = (
+            1
+            if self.skip_merging
+            else self.file_merging
+        )
+
+        chunks = law.util.iter_chunks(
+            n_reduced_files,
+            n_merge,
+        )
+
+        return dict(enumerate(chunks))
 
     @workflow_condition.create_branch_map
     def create_branch_map(self):
