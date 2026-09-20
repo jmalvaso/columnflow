@@ -2595,36 +2595,52 @@ class DatasetShiftSourcesMixin(ShiftSourcesMixin, DatasetTask):
     # allow empty sources
     allow_empty_shift_sources = True
 
-
 class ChunkedIOMixin(ConfigTask):
 
     check_finite_output = luigi.BoolParameter(
         default=False,
         significant=False,
-        description="when True, checks whether output arrays only contain finite values before writing to them to "
-        "file; default: False",
+        description=(
+            "when True, checks whether output arrays only contain finite values "
+            "before writing to them to file; default: False"
+        ),
     )
+
     check_overlapping_inputs = luigi.BoolParameter(
         default=False,
         significant=False,
-        description="when True, checks whether columns if input arrays overlap in at least one field; default: False",
+        description=(
+            "when True, checks whether columns if input arrays overlap in at least "
+            "one field; default: False"
+        ),
     )
 
     # number of events per row group in the merged file
-    merging_row_group_size = law.config.get_expanded_int("analysis", "merging_row_group_size", 50_000)
+    merging_row_group_size = law.config.get_expanded_int(
+        "analysis",
+        "merging_row_group_size",
+        50_000,
+    )
 
-    exclude_params_req = {"check_finite_output", "check_overlapping_inputs"}
+    exclude_params_req = {
+        "check_finite_output",
+        "check_overlapping_inputs",
+    }
 
     # define default chunk and pool sizes that can be adjusted per inheriting task
     default_chunk_size = ChunkedIOHandler.default_chunk_size
     default_pool_size = ChunkedIOHandler.default_pool_size
 
     @classmethod
-    def raise_if_not_finite(cls, ak_array: ak.Array) -> None:
+    def raise_if_not_finite(
+        cls,
+        ak_array: ak.Array,
+    ) -> None:
         """
-        Checks whether values of all columns in *ak_array* are finite. String and bytestring types are skipped.
+        Checks whether values of all columns in *ak_array* are finite.
+        String and bytestring types are skipped.
 
-        The check is performed using the :external+numpy:py:func:`numpy.isfinite` function.
+        The check is performed using numpy.isfinite.
 
         :param ak_array: Array with columns to check.
         :raises ValueError: If any value in *ak_array* is not finite.
@@ -2632,26 +2648,59 @@ class ChunkedIOMixin(ConfigTask):
         from columnflow.columnar_util import get_ak_routes
 
         non_finite_routes = []
+
         for route in get_ak_routes(ak_array):
+
             # flatten
-            flat = ak.flatten(route.apply(ak_array), axis=None)
+            flat = ak.flatten(
+                route.apply(ak_array),
+                axis=None,
+            )
+
             # perform parameter dependent checks
-            if isinstance((params := getattr(getattr(flat, "layout", None), "parameters", None)), dict):
+            params = getattr(
+                getattr(
+                    flat,
+                    "layout",
+                    None,
+                ),
+                "parameters",
+                None,
+            )
+
+            if isinstance(params, dict):
+
                 # skip string and bytestring arrays
-                if params.get("__array__") in {"string", "bytestring"}:
+                if params.get("__array__") in {
+                    "string",
+                    "bytestring",
+                }:
                     continue
+
             # check finiteness
-            if ak.any(~np.isfinite(flat)):
-                non_finite_routes.append(route)
+            if ak.any(
+                ~np.isfinite(flat)
+            ):
+                non_finite_routes.append(
+                    route
+                )
 
         if non_finite_routes:
             raise ValueError(
-                f"found non-finite values in {len(non_finite_routes)} column(s) of array {ak_array}:\n  - " +
-                "\n  - ".join(r.column for r in non_finite_routes),
+                f"found non-finite values in "
+                f"{len(non_finite_routes)} column(s) "
+                f"of array {ak_array}:\n  - "
+                + "\n  - ".join(
+                    r.column
+                    for r in non_finite_routes
+                )
             )
 
     @classmethod
-    def raise_if_overlapping(cls, ak_arrays: Sequence[ak.Array]) -> None:
+    def raise_if_overlapping(
+        cls,
+        ak_arrays: Sequence[ak.Array],
+    ) -> None:
         """
         Checks whether fields of *ak_arrays* overlap.
 
@@ -2660,63 +2709,130 @@ class ChunkedIOMixin(ConfigTask):
         """
         from columnflow.columnar_util import get_ak_routes
 
-        # when less than two arrays are given, there cannot be any overlap
+        # when less than two arrays are given,
+        # there cannot be any overlap
         if len(ak_arrays) < 2:
             return
 
         # determine overlapping routes
-        counts = Counter(sum(map(get_ak_routes, ak_arrays), []))
-        overlapping_routes = [r for r, c in counts.items() if c > 1]
+        counts = Counter(
+            sum(
+                map(
+                    get_ak_routes,
+                    ak_arrays,
+                ),
+                [],
+            )
+        )
 
-        # raise
+        overlapping_routes = [
+            r
+            for r, c in counts.items()
+            if c > 1
+        ]
+
         if overlapping_routes:
             raise ValueError(
-                f"found {len(overlapping_routes)} overlapping columns across {len(ak_arrays)} "
-                f"columns: {','.join(overlapping_routes)}",
+                f"found {len(overlapping_routes)} overlapping columns "
+                f"across {len(ak_arrays)} columns: "
+                f"{','.join(map(str, overlapping_routes))}"
             )
 
-    def iter_chunked_io(self, *args, **kwargs):
-        # get the chunked io handler from first arg or create a new one with all args
-        if len(args) == 1 and isinstance(args[0], ChunkedIOHandler):
+    def iter_chunked_io(
+        self,
+        *args,
+        **kwargs,
+    ):
+        # get the chunked io handler from first arg or create a new one
+        if (
+            len(args) == 1
+            and isinstance(
+                args[0],
+                ChunkedIOHandler,
+            )
+        ):
             handler = args[0]
+
         else:
             # default chunk and pool sizes
-            for key in ["chunk_size", "pool_size"]:
+            for key in [
+                "chunk_size",
+                "pool_size",
+            ]:
+
                 if kwargs.get(key) is None:
-                    # get the default from the config, defaulting to the class default
-                    kwargs[key] = law.config.get_expanded_int(
-                        "analysis",
-                        f"{self.task_family}__chunked_io_{key}",
-                        getattr(self, f"default_{key}"),
+                    kwargs[key] = (
+                        law.config.get_expanded_int(
+                            "analysis",
+                            f"{self.task_family}"
+                            f"__chunked_io_{key}",
+                            getattr(
+                                self,
+                                f"default_{key}",
+                            ),
+                        )
                     )
-                # when still not set, remove it and let the handler decide using its defaults
+
+                # when still not set, remove it and let
+                # the handler use its defaults
                 if kwargs.get(key) is None:
-                    kwargs.pop(key, None)
+                    kwargs.pop(
+                        key,
+                        None,
+                    )
+
             # create the handler
-            handler = ChunkedIOHandler(*args, **kwargs)
+            handler = ChunkedIOHandler(
+                *args,
+                **kwargs,
+            )
 
         # iterate in the handler context
         with handler:
+
             self.chunked_io = handler
+
             filter_msg = (
                 ""
-                if handler.n_entries_filtered == handler.n_entries_total
-                else f" (filtered out of {handler.n_entries_total:_})"
+                if (
+                    handler.n_entries_filtered
+                    == handler.n_entries_total
+                )
+                else (
+                    f" (filtered out of "
+                    f"{handler.n_entries_total:_})"
+                )
             )
-            msg = f"iterate through {handler.n_entries_filtered:_}{filter_msg} events in {handler.n_chunks} chunks ..."
+
+            msg = (
+                f"iterate through "
+                f"{handler.n_entries_filtered:_}"
+                f"{filter_msg} events in "
+                f"{handler.n_chunks} chunks ..."
+            )
+
             try:
                 # measure runtimes excluding IO
                 loop_durations = []
-                for obj in self.iter_progress(handler, max(handler.n_chunks, 1), msg=msg):
+
+                for obj in self.iter_progress(
+                    handler,
+                    max(
+                        handler.n_chunks,
+                        1,
+                    ),
+                    msg=msg,
+                ):
                     t1 = time.perf_counter()
 
                     # yield the object provided by the handler
                     yield obj
 
-                    # save the runtime
-                    loop_durations.append(time.perf_counter() - t1)
+                    loop_durations.append(
+                        time.perf_counter()
+                        - t1
+                    )
 
-                # print runtimes
                 self.publish_message(
                     "event processing in loop body took "
                     f"{law.util.human_duration(seconds=sum(loop_durations))}",
@@ -2728,16 +2844,56 @@ class ChunkedIOMixin(ConfigTask):
         # eager cleanup
         del handler
 
+    @staticmethod
+    def _first_input_target(
+        input_obj: Any,
+    ) -> Any | None:
+        """
+        Return the first concrete target from a possibly nested
+        list or tuple.
+
+        With DatasetTask.file_merging > 1, one logical NanoAOD
+        input is represented by multiple file targets, e.g.
+
+            [
+                target(nano_0.root),
+                target(nano_1.root),
+                ...
+            ]
+
+        ChunkedIOHandler supports this grouped source directly,
+        but helper methods such as get_read_options() and
+        get_filter_configs() only need one representative target
+        to determine the file extension and NanoAOD-specific
+        configuration.
+        """
+
+        while isinstance(
+            input_obj,
+            (list, tuple),
+        ):
+            if not input_obj:
+                return None
+
+            input_obj = input_obj[0]
+
+        return input_obj
+
     def get_open_options(
         self,
         inputs: list[Any],
         *,
         first_is_nano: bool = False,
-    ) -> list[dict[str, Any] | None] | None:
+    ) -> list[
+        dict[str, Any] | None
+    ] | None:
         """
-        Hook that takes a list of *input* files handled during iteration and returns a list of dictionaries that
-        represent *open_options* per input file. When *first_is_nano* is True, the first input file is an external
-        NanoAOD file.
+        Hook that takes a list of input files handled during
+        iteration and returns open options per logical input.
+
+        When first_is_nano is True, the first logical input can
+        either be one NanoAOD target or a list of NanoAOD targets
+        when file merging is enabled.
         """
         return len(inputs) * [None]
 
@@ -2746,21 +2902,58 @@ class ChunkedIOMixin(ConfigTask):
         inputs: list[Any],
         *,
         first_is_nano: bool = False,
-    ) -> list[dict[str, Any] | None] | None:
+    ) -> list[
+        dict[str, Any] | None
+    ] | None:
         """
-        Hook that takes a list of *input* files handled during iteration and returns a list of dictionaries that
-        represent *read_options* per input file. When *first_is_nano* is True, the first input file is an external
-        NanoAOD file.
+        Return read options per logical input.
+
+        In particular, support grouped NanoAOD inputs produced by
+        DatasetTask.file_merging > 1.
         """
-        read_options = [None] * len(inputs)
-        if inputs and first_is_nano and inputs[0].ext() == "root":
-            read_options[0] = self._get_nano_read_options(inputs[0])
+
+        read_options = [
+            None
+        ] * len(inputs)
+
+        if (
+            inputs
+            and first_is_nano
+        ):
+            first_input = (
+                self._first_input_target(
+                    inputs[0],
+                )
+            )
+
+            if (
+                first_input is not None
+                and first_input.ext()
+                == "root"
+            ):
+                read_options[0] = (
+                    self._get_nano_read_options(
+                        first_input,
+                    )
+                )
+
         return read_options
 
-    def _get_nano_read_options(self, target: law.FileSystemFileTarget) -> dict[str, Any] | None:
+    def _get_nano_read_options(
+        self,
+        target: law.FileSystemFileTarget,
+    ) -> dict[str, Any] | None:
         return (
-            func(self, target)
-            if callable(func := self.config_inst.x("get_nano_read_options", None))
+            func(
+                self,
+                target,
+            )
+            if callable(
+                func := self.config_inst.x(
+                    "get_nano_read_options",
+                    None,
+                )
+            )
             else None
         )
 
@@ -2769,43 +2962,118 @@ class ChunkedIOMixin(ConfigTask):
         inputs: list[Any],
         *,
         first_is_nano: bool = False,
-    ) -> list[ChunkedIOHandler.FilterConfig | None] | None:
+    ) -> list[
+        ChunkedIOHandler.FilterConfig | None
+    ] | None:
         """
-        Hook that takes a list of *input* files handled during iteration and returns a list of
-        :py:func:`ChunkedIOHandler.FilterConfig` instances that are passed to the :py:class:`ChunkedIOHandler` for
-        filtering chunks. When *first_is_nano* is True, the first input file is an external NanoAOD file.
+        Return filter configurations per logical input.
+
+        Supports a grouped NanoAOD source in inputs[0].
         """
-        filter_configs = [None] * len(inputs)
-        if inputs and first_is_nano and inputs[0].ext() == "root":
-            filter_configs[0] = self._get_nano_filter_config(inputs[0])
+
+        filter_configs = [
+            None
+        ] * len(inputs)
+
+        if (
+            inputs
+            and first_is_nano
+        ):
+            first_input = (
+                self._first_input_target(
+                    inputs[0],
+                )
+            )
+
+            if (
+                first_input is not None
+                and first_input.ext()
+                == "root"
+            ):
+                filter_configs[0] = (
+                    self._get_nano_filter_config(
+                        first_input,
+                    )
+                )
+
         return filter_configs
 
-    def _get_nano_filter_config(self, target: law.FileSystemFileTarget) -> ChunkedIOHandler.FilterConfig | None:
-        if not callable(get_nano_filter_config := self.config_inst.x("get_nano_filter_config", None)):
+    def _get_nano_filter_config(
+        self,
+        target: law.FileSystemFileTarget,
+    ) -> ChunkedIOHandler.FilterConfig | None:
+
+        get_nano_filter_config = (
+            self.config_inst.x(
+                "get_nano_filter_config",
+                None,
+            )
+        )
+
+        if not callable(
+            get_nano_filter_config
+        ):
             return None
 
         # evaluate the function to get the filter config
-        nano_filter_config = get_nano_filter_config(self, target)
+        nano_filter_config = (
+            get_nano_filter_config(
+                self,
+                target,
+            )
+        )
+
         if nano_filter_config is None:
             return None
 
-        if not isinstance(nano_filter_config, ChunkedIOHandler.FilterConfig):
+        if not isinstance(
+            nano_filter_config,
+            ChunkedIOHandler.FilterConfig,
+        ):
             try:
-                nano_filter_config = ChunkedIOHandler.FilterConfig(*nano_filter_config)
+                nano_filter_config = (
+                    ChunkedIOHandler.FilterConfig(
+                        *nano_filter_config
+                    )
+                )
+
             except TypeError as e:
                 raise TypeError(
-                    f"invalid 'nano_filter_config' for {self.config_mode()} config task {self!r}: {e}",
+                    f"invalid 'nano_filter_config' "
+                    f"for {self.config_mode()} "
+                    f"config task {self!r}: {e}"
                 ) from e
 
         return nano_filter_config
 
-    def adjust_chunks(self, chunks: list[ak.Array | np.ndarray]) -> list[ak.Array | np.ndarray]:
+    def adjust_chunks(
+        self,
+        chunks: list[
+            ak.Array | np.ndarray
+        ],
+    ) -> list[
+        ak.Array | np.ndarray
+    ]:
         """
-        Hook that takes a list of *chunks* handled during iteration and returns an adjusted or amended list of chunks.
-        The default implementation returns the chunks unchanged.
+        Hook that takes a list of chunks handled during iteration
+        and returns an adjusted or amended list of chunks.
         """
-        if callable(adjust_func := self.config_inst.x("adjust_nano_chunks", None)):
-            chunks = adjust_func(self, chunks)
+
+        adjust_func = (
+            self.config_inst.x(
+                "adjust_nano_chunks",
+                None,
+            )
+        )
+
+        if callable(
+            adjust_func
+        ):
+            chunks = adjust_func(
+                self,
+                chunks,
+            )
+
         return chunks
 
 

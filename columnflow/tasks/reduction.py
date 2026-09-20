@@ -13,7 +13,12 @@ import law
 import luigi
 
 from columnflow.tasks.framework.base import Requirements, AnalysisTask, wrapper_factory
-from columnflow.tasks.framework.mixins import CalibratorsMixin, SelectorMixin, ReducerMixin, ChunkedIOMixin
+from columnflow.tasks.framework.mixins import (
+    CalibratorsMixin,
+    SelectorMixin,
+    ReducerMixin,
+    ChunkedIOMixin,
+)
 from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.framework.decorators import on_failure
 from columnflow.tasks.external import GetDatasetLFNs
@@ -21,11 +26,15 @@ from columnflow.tasks.selection import CalibrateEvents, SelectEvents
 from columnflow.util import maybe_import, ensure_proxy, dev_sandbox, safe_div, DotDict
 from columnflow.types import Any
 
+
 ak = maybe_import("awkward")
 
 
 # default parameters
-default_keep_reduced_events = law.config.get_expanded("analysis", "default_keep_reduced_events")
+default_keep_reduced_events = law.config.get_expanded(
+    "analysis",
+    "default_keep_reduced_events",
+)
 
 
 class _ReduceEvents(
@@ -43,7 +52,12 @@ class _ReduceEvents(
 
 class ReduceEvents(_ReduceEvents):
 
-    sandbox = dev_sandbox(law.config.get("analysis", "default_columnar_sandbox"))
+    sandbox = dev_sandbox(
+        law.config.get(
+            "analysis",
+            "default_columnar_sandbox",
+        ),
+    )
 
     # upstream requirements
     reqs = Requirements(
@@ -64,19 +78,29 @@ class ReduceEvents(_ReduceEvents):
         reqs["lfns"] = self.reqs.GetDatasetLFNs.req(self)
 
         # depending on pilot flag, add upstream workflows or pass-through their own requirements only
-        reqs["calibrations"] = list(map(self.pilot_workflow_requires, (
-            self.reqs.CalibrateEvents.req(
-                self,
-                calibrator=calibrator_inst.cls_name,
-                calibrator_inst=calibrator_inst,
-            )
-            for calibrator_inst in self.calibrator_insts
-            if calibrator_inst.produced_columns
-        )))
-        reqs["selection"] = self.pilot_workflow_requires(self.reqs.SelectEvents.req(self))
+        reqs["calibrations"] = list(map(
+            self.pilot_workflow_requires,
+            (
+                self.reqs.CalibrateEvents.req(
+                    self,
+                    calibrator=calibrator_inst.cls_name,
+                    calibrator_inst=calibrator_inst,
+                )
+                for calibrator_inst in self.calibrator_insts
+                if calibrator_inst.produced_columns
+            ),
+        ))
+
+        reqs["selection"] = self.pilot_workflow_requires(
+            self.reqs.SelectEvents.req(self),
+        )
 
         # add reducer dependent requirements
-        reqs["reducer"] = law.util.make_unique(law.util.flatten(self.reducer_inst.run_requires(task=self)))
+        reqs["reducer"] = law.util.make_unique(
+            law.util.flatten(
+                self.reducer_inst.run_requires(task=self),
+            ),
+        )
 
         return reqs
 
@@ -93,11 +117,19 @@ class ReduceEvents(_ReduceEvents):
                 if calibrator_inst.produced_columns
             ],
             "selection": self.reqs.SelectEvents.req(self),
-            "reducer": law.util.make_unique(law.util.flatten(self.reducer_inst.run_requires(task=self))),
+            "reducer": law.util.make_unique(
+                law.util.flatten(
+                    self.reducer_inst.run_requires(task=self),
+                ),
+            ),
         }
 
     def output(self):
-        return {"events": self.target(f"events_{self.branch}.parquet")}
+        return {
+            "events": self.target(
+                f"events_{self.branch}.parquet",
+            ),
+        }
 
     @law.decorator.notify
     @law.decorator.log
@@ -107,8 +139,13 @@ class ReduceEvents(_ReduceEvents):
     @on_failure(callback=lambda task: task.teardown_reducer_inst())
     def run(self):
         from columnflow.columnar_util import (
-            Route, RouteFilter, mandatory_coffea_columns, update_ak_array, add_ak_aliases,
-            sorted_ak_to_parquet, attach_coffea_behavior,
+            Route,
+            RouteFilter,
+            mandatory_coffea_columns,
+            update_ak_array,
+            add_ak_aliases,
+            sorted_ak_to_parquet,
+            attach_coffea_behavior,
         )
 
         # prepare inputs and outputs
@@ -117,64 +154,111 @@ class ReduceEvents(_ReduceEvents):
         output = self.output()
         output_chunks = {}
 
-        # for evaluating new object collections to write based on the "objects" field of the selection result data,
-        # create a mapping of src_col to dst_col's using only file meta data
+        # for evaluating new object collections to write based on the "objects" field
+        # of the selection result data, create a mapping of src_col to dst_col's using
+        # only file metadata
         self.collection_map: dict[str, list[str]] = {}
-        sel_meta = inputs["selection"]["results"].load(formatter="dask_awkward")
+
+        sel_meta = inputs["selection"]["results"].load(
+            formatter="dask_awkward",
+        )
+
         if "objects" in sel_meta.fields:
             for src_col in sel_meta.objects.fields:
-                self.collection_map[src_col] = list(sel_meta.objects[src_col].fields)
+                self.collection_map[src_col] = list(
+                    sel_meta.objects[src_col].fields,
+                )
+
         del sel_meta
 
         # run the reducer setup
         self._array_function_post_init()
-        reducer_reqs = self.reducer_inst.run_requires(task=self)
+
+        reducer_reqs = self.reducer_inst.run_requires(
+            task=self,
+        )
+
         reader_targets = self.reducer_inst.run_setup(
             task=self,
             reqs=reducer_reqs,
             inputs=luigi.task.getpaths(reducer_reqs),
         )
 
-        # special case for reducers: issue a warning in case the upstream selector has shifts registered that are not
-        # known to the reducer, meaning that requested shifts would be known as global but not local ones, leading to
-        # the nominal behavior in the event chunk loop below, especially regarding alias handling
-        if (missing_reducer_shifts := self.selector_inst.all_shifts - self.reducer_inst.all_shifts):
+        # special case for reducers: issue a warning in case the upstream selector
+        # has shifts registered that are not known to the reducer
+        if (
+            missing_reducer_shifts :=
+            self.selector_inst.all_shifts -
+            self.reducer_inst.all_shifts
+        ):
             self.logger.warning(
-                f"the upstream selector '{self.selector_inst.cls_name}' has {len(missing_reducer_shifts)} shifts "
-                f"registered that are not known to this reducer '{self.reducer_inst.cls_name}'; please check your "
-                "reducer as this is probably a misconfiguration and can lead to mismatches between event selection and "
-                "reduction, especially when shift-specific aliases are to be applied; missing shifts:\n"
+                f"the upstream selector '{self.selector_inst.cls_name}' has "
+                f"{len(missing_reducer_shifts)} shifts registered that are not "
+                f"known to this reducer '{self.reducer_inst.cls_name}'; please "
+                "check your reducer as this is probably a misconfiguration and "
+                "can lead to mismatches between event selection and reduction, "
+                "especially when shift-specific aliases are to be applied; "
+                "missing shifts:\n"
                 f"{', '.join(sorted(missing_reducer_shifts))}",
             )
 
         # create a temp dir for saving intermediate files
-        tmp_dir = law.LocalDirectoryTarget(is_tmp=True)
+        tmp_dir = law.LocalDirectoryTarget(
+            is_tmp=True,
+        )
         tmp_dir.touch()
 
         # get shift dependent aliases
-        aliases = self.local_shift_inst.x("column_aliases", {})
+        aliases = self.local_shift_inst.x(
+            "column_aliases",
+            {},
+        )
 
-        # define columns that will be written based on the reducer's produced columns,
-        # but taking into account those that should be skipped (e.g. if not all routes added by a collection are needed)
+        # define columns that will be written
         write_columns: set[Route] = set()
         skip_columns: set[Route] = set()
+
         for c in self.reducer_inst.produced_columns:
             for r in self._expand_keep_column(c):
                 if r.has_tag("skip"):
                     skip_columns.add(r)
                 else:
                     write_columns.add(r)
-        route_filter = RouteFilter(keep=write_columns, remove=skip_columns)
+
+        route_filter = RouteFilter(
+            keep=write_columns,
+            remove=skip_columns,
+        )
 
         # define columns that need to be read
-        read_columns = set(map(Route, mandatory_coffea_columns))
-        read_columns |= self.reducer_inst.used_columns
-        read_columns |= set(map(Route, set(aliases.values())))
+        read_columns = set(
+            map(
+                Route,
+                mandatory_coffea_columns,
+            ),
+        )
 
-        # columns starting with "steps." and "objects." are implicitly treated as pointing to the selection result data
-        read_sel_columns = {Route("event")}
+        read_columns |= self.reducer_inst.used_columns
+        read_columns |= set(
+            map(
+                Route,
+                set(aliases.values()),
+            ),
+        )
+
+        # columns starting with "steps." and "objects." are implicitly treated
+        # as pointing to the selection result data
+        read_sel_columns = {
+            Route("event"),
+        }
+
         for r in list(read_columns):
-            if r.column.startswith(("steps.", "objects.")):
+            if r.column.startswith(
+                (
+                    "steps.",
+                    "objects.",
+                ),
+            ):
                 read_sel_columns.add(r)
                 read_columns.remove(r)
 
@@ -183,40 +267,100 @@ class ReduceEvents(_ReduceEvents):
         n_reduced = 0
 
         # let the lfn_task locate and prepare the nano file(s)
-        nano_input = [nano_target for _, nano_target in lfn_task.iter_nano_files(self)]
+        nano_input = [
+            nano_target
+            for _, nano_target
+            in lfn_task.iter_nano_files(self)
+        ]
+
         if len(nano_input) == 1:
             nano_input = nano_input[0]
 
         # collect input targets
-        input_targets = [nano_input]
-        input_targets.append(inputs["selection"]["results"])
-        input_targets.extend([inp["columns"] for inp in inputs["calibrations"]])
+        input_targets = [
+            nano_input,
+        ]
+
+        input_targets.append(
+            inputs["selection"]["results"],
+        )
+
+        input_targets.extend(
+            inp["columns"]
+            for inp in inputs["calibrations"]
+        )
+
         if self.selector_inst.produced_columns:
-            input_targets.append(inputs["selection"]["columns"])
-        input_targets.extend(reader_targets.values())
+            input_targets.append(
+                inputs["selection"]["columns"],
+            )
+
+        input_targets.extend(
+            reader_targets.values(),
+        )
 
         # prepare inputs for localization
-        with law.localize_file_targets(input_targets, mode="r") as inps:
+        with law.localize_file_targets(
+            input_targets,
+            mode="r",
+        ) as inps:
+
             # iterate over chunks of events and diffs
             for (events, sel, *cols), pos in self.iter_chunked_io(
-                law.util.map_struct(law.target.file.get_path, inps),
-                source_type=["coffea_root"] + (len(inps) - 1) * ["awkward_parquet"],
-                open_options=self.get_open_options(inps, first_is_nano=True),
-                read_options=self.get_read_options(inps, first_is_nano=True),
-                read_columns=[read_columns, read_sel_columns] + (len(inps) - 2) * [read_columns],
-                filter_config=self.get_filter_configs(inps, first_is_nano=True),
+                law.util.map_struct(
+                    law.target.file.get_path,
+                    inps,
+                ),
+                source_type=[
+                    "coffea_root",
+                ] + (
+                    len(inps) - 1
+                ) * [
+                    "awkward_parquet",
+                ],
+                open_options=self.get_open_options(
+                    inps,
+                    first_is_nano=True,
+                ),
+                read_options=self.get_read_options(
+                    inps,
+                    first_is_nano=True,
+                ),
+                read_columns=[
+                    read_columns,
+                    read_sel_columns,
+                ] + (
+                    len(inps) - 2
+                ) * [
+                    read_columns,
+                ],
+                filter_config=self.get_filter_configs(
+                    inps,
+                    first_is_nano=True,
+                ),
                 chunk_size=self.reducer_inst.get_min_chunk_size(),
             ):
+
                 # adjust if necessary
                 if callable(self.adjust_chunks):
-                    events, *cols = self.adjust_chunks([events, *cols])
+                    events, *cols = self.adjust_chunks(
+                        [
+                            events,
+                            *cols,
+                        ],
+                    )
 
                 # optional check for overlapping inputs within cols
                 if self.check_overlapping_inputs:
-                    self.raise_if_overlapping(list(cols))
+                    self.raise_if_overlapping(
+                        list(cols),
+                    )
 
                 # add the calibrated cols and potentially new columns
-                events = update_ak_array(events, *cols)
+                events = update_ak_array(
+                    events,
+                    *cols,
+                )
 
                 # add aliases
                 events = add_ak_aliases(
@@ -229,34 +373,71 @@ class ReduceEvents(_ReduceEvents):
                 # invoke the reducer
                 if len(events) > 0:
                     n_all += len(events)
-                    events = attach_coffea_behavior(events)
-                    events = self.reducer_inst(events, selection=sel, task=self)
+
+                    events = attach_coffea_behavior(
+                        events,
+                    )
+
+                    events = self.reducer_inst(
+                        events,
+                        selection=sel,
+                        task=self,
+                    )
+
                     n_reduced += len(events)
 
-                # no need to proceed when no events are left (except for the last chunk to create empty output)
-                if len(events) == 0 and (output_chunks or pos.index < pos.n_chunks - 1):
+                # no need to proceed when no events are left
+                if (
+                    len(events) == 0
+                    and (
+                        output_chunks
+                        or pos.index < pos.n_chunks - 1
+                    )
+                ):
                     continue
 
                 # remove columns
-                events = route_filter(events)
+                events = route_filter(
+                    events,
+                )
 
                 # optional check for finite values
                 if self.check_finite_output:
-                    self.raise_if_not_finite(events)
+                    self.raise_if_not_finite(
+                        events,
+                    )
 
                 # save as parquet via a thread in the same pool
-                chunk = tmp_dir.child(f"file_{pos.index}.parquet", type="f")
+                chunk = tmp_dir.child(
+                    f"file_{pos.index}.parquet",
+                    type="f",
+                )
+
                 output_chunks[pos.index] = chunk
-                self.chunked_io.queue(sorted_ak_to_parquet, (ak.to_packed(events), chunk.abspath))
+
+                self.chunked_io.queue(
+                    sorted_ak_to_parquet,
+                    (
+                        ak.to_packed(events),
+                        chunk.abspath,
+                    ),
+                )
 
         # teardown the reducer
         self.teardown_reducer_inst()
 
         # some logs
-        self.publish_message(f"reduced {n_all:_} to {n_reduced:_} events ({safe_div(n_reduced, n_all) * 100:.2f}%)")
+        self.publish_message(
+            f"reduced {n_all:_} to {n_reduced:_} events "
+            f"({safe_div(n_reduced, n_all) * 100:.2f}%)",
+        )
 
         # merge output files
-        sorted_chunks = [output_chunks[key] for key in sorted(output_chunks)]
+        sorted_chunks = [
+            output_chunks[key]
+            for key in sorted(output_chunks)
+        ]
+
         law.pyarrow.merge_parquet_task(
             task=self,
             inputs=sorted_chunks,
@@ -268,39 +449,86 @@ class ReduceEvents(_ReduceEvents):
 
 
 # overwrite class defaults
-check_finite_tasks = law.config.get_expanded("analysis", "check_finite_output", [], split_csv=True)
-ReduceEvents.check_finite_output = ChunkedIOMixin.check_finite_output.copy(
-    default=ReduceEvents.task_family in check_finite_tasks,
-    add_default_to_description=True,
+check_finite_tasks = law.config.get_expanded(
+    "analysis",
+    "check_finite_output",
+    [],
+    split_csv=True,
 )
 
-check_overlap_tasks = law.config.get_expanded("analysis", "check_overlapping_inputs", [], split_csv=True)
-ReduceEvents.check_overlapping_inputs = ChunkedIOMixin.check_overlapping_inputs.copy(
-    default=ReduceEvents.task_family in check_overlap_tasks,
-    add_default_to_description=True,
+ReduceEvents.check_finite_output = (
+    ChunkedIOMixin
+    .check_finite_output
+    .copy(
+        default=(
+            ReduceEvents.task_family
+            in check_finite_tasks
+        ),
+        add_default_to_description=True,
+    )
 )
+
+
+check_overlap_tasks = law.config.get_expanded(
+    "analysis",
+    "check_overlapping_inputs",
+    [],
+    split_csv=True,
+)
+
+ReduceEvents.check_overlapping_inputs = (
+    ChunkedIOMixin
+    .check_overlapping_inputs
+    .copy(
+        default=(
+            ReduceEvents.task_family
+            in check_overlap_tasks
+        ),
+        add_default_to_description=True,
+    )
+)
+
 
 ReduceEventsWrapper = wrapper_factory(
     base_cls=AnalysisTask,
     require_cls=ReduceEvents,
-    enable=["configs", "skip_configs", "datasets", "skip_datasets", "shifts", "skip_shifts"],
+    enable=[
+        "configs",
+        "skip_configs",
+        "datasets",
+        "skip_datasets",
+        "shifts",
+        "skip_shifts",
+    ],
 )
+
+
+# =============================================================================
+# Helpers for consecutive file merging
+# =============================================================================
+
 def _get_reduce_file_merging_factor(task) -> int:
     """
     Return the number of original dataset files handled by one
     ReduceEvents branch.
     """
     n_files = task.dataset_info_inst.n_files
+
+    if n_files <= 0:
+        raise ValueError(
+            f"dataset '{task.dataset_inst.name}' has invalid n_files={n_files}",
+        )
+
     file_merging = ReduceEvents.file_merging
 
     if isinstance(file_merging, int):
         if file_merging < 0:
-            raise ValueError(f"invalid ReduceEvents.file_merging value {file_merging}")
+            raise ValueError(
+                f"invalid ReduceEvents.file_merging value {file_merging}",
+            )
 
-        # file_merging == 0 means merge the full dataset into one branch
         return n_files if file_merging == 0 else file_merging
 
-    # None means one original file per branch
     return 1
 
 
@@ -309,9 +537,18 @@ def _get_n_reduced_files(task) -> int:
     Return the number of ReduceEvents output branches.
     """
     n_files = task.dataset_info_inst.n_files
-    file_merging = _get_reduce_file_merging_factor(task)
+    file_merging = _get_reduce_file_merging_factor(
+        task,
+    )
 
-    return math.ceil(n_files / file_merging)
+    return math.ceil(
+        n_files / file_merging,
+    )
+
+
+# =============================================================================
+# MergeReductionStats
+# =============================================================================
 
 class _MergeReductionStats(
     CalibratorsMixin,
@@ -330,164 +567,397 @@ class MergeReductionStats(_MergeReductionStats):
     n_inputs = luigi.IntParameter(
         default=10,
         significant=True,
-        description="minimal number of input files to infer merging factors with sufficient statistics; default: 10",
+        description=(
+            "minimal number of input files to infer merging "
+            "factors with sufficient statistics; default: 10"
+        ),
     )
+
     merged_size = law.BytesParameter(
         default=law.NO_FLOAT,
         unit="MB",
         significant=False,
-        description="the maximum file size of merged files; default unit is MB; when 0, the merging factor is not "
-        "actually calculated from input files, but it is assumed to be 1 (= no merging); default: config value "
-        "'reduced_file_size' or 512MB",
+        description=(
+            "the maximum file size of merged files; default "
+            "unit is MB; when 0, the merging factor is not "
+            "actually calculated from input files, but it is "
+            "assumed to be 1 (= no merging); default: config "
+            "value 'reduced_file_size' or 512MB"
+        ),
     )
 
-    # upstream requirements
     reqs = Requirements(
         RemoteWorkflow.reqs,
         ReduceEvents=ReduceEvents,
     )
 
     @classmethod
-    def resolve_param_values(cls, params: dict[str, Any]) -> dict[str, Any]:
-        params = super().resolve_param_values(params)
+    def resolve_param_values(
+        cls,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
 
-        # check for the default merged size
+        params = super().resolve_param_values(
+            params,
+        )
+
         if "merged_size" in params:
-            if params["merged_size"] in {None, law.NO_FLOAT}:
+
+            if params["merged_size"] in {
+                None,
+                law.NO_FLOAT,
+            }:
                 merged_size = 512.0
+
                 if "config_inst" in params:
-                    merged_size = params["config_inst"].x("reduced_file_size", merged_size)
-                params["merged_size"] = float(merged_size)
+                    merged_size = (
+                        params["config_inst"]
+                        .x(
+                            "reduced_file_size",
+                            merged_size,
+                        )
+                    )
+
+                params["merged_size"] = float(
+                    merged_size,
+                )
+
             elif params["merged_size"] == 0:
                 params["n_inputs"] = 0
 
         return params
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ) -> None:
 
-        # cap n_inputs to the actual number of ReduceEvents outputs
-        n_reduced_files = _get_n_reduced_files(self)
+        super().__init__(
+            *args,
+            **kwargs,
+        )
 
-        if self.n_inputs < 0 or self.n_inputs > n_reduced_files:
+        # Number of files entering this stage is the number
+        # of ReduceEvents outputs, not the original NanoAOD count.
+        n_reduced_files = _get_n_reduced_files(
+            self,
+        )
+
+        if (
+            self.n_inputs < 0
+            or self.n_inputs > n_reduced_files
+        ):
             self.n_inputs = n_reduced_files
 
     def create_branch_map(self):
-        # single branch without payload
-        return {0: None}
+        return {
+            0: None,
+        }
 
     def workflow_requires(self):
         reqs = super().workflow_requires()
+
         if self.merged_size == 0:
             return reqs
 
-        reqs["events"] = self.reqs.ReduceEvents.req_different_branching(
-            self,
-            branches=((0, self.n_inputs),),
+        reqs["events"] = (
+            self.reqs.ReduceEvents
+            .req_different_branching(
+                self,
+                branches=(
+                    (
+                        0,
+                        self.n_inputs,
+                    ),
+                ),
+            )
         )
+
         return reqs
 
     def requires(self):
+
         if self.merged_size == 0:
             return []
 
-        return self.reqs.ReduceEvents.req_different_branching(
-            self,
-            workflow="local",
-            branches=((0, self.n_inputs),),
-            _exclude={"branch"},
+        return (
+            self.reqs.ReduceEvents
+            .req_different_branching(
+                self,
+                workflow="local",
+                branches=(
+                    (
+                        0,
+                        self.n_inputs,
+                    ),
+                ),
+                _exclude={
+                    "branch",
+                },
+            )
         )
 
     def output(self):
-        return {"stats": self.target(f"stats_n{self.n_inputs}.json")}
+        return {
+            "stats": self.target(
+                f"stats_n{self.n_inputs}.json",
+            ),
+        }
 
     @law.decorator.notify
     @law.decorator.log
     @law.decorator.safe_output
     def run(self):
-        # structure for statistics to save
+
         stats = OrderedDict([
-            ("n_test_files", 0),
-            ("tot_size", 0),
-            ("avg_size", 0),
-            ("std_size", 0),
-            ("max_size_merged", 0),
-            ("merge_factor", 1),
+            (
+                "n_test_files",
+                0,
+            ),
+            (
+                "tot_size",
+                0,
+            ),
+            (
+                "avg_size",
+                0,
+            ),
+            (
+                "std_size",
+                0,
+            ),
+            (
+                "max_size_merged",
+                0,
+            ),
+            (
+                "merge_factor",
+                1,
+            ),
         ])
 
-        # assume a merging factor of 1 when the merged size is 0
         if self.merged_size == 0:
-            self.output()["stats"].dump(stats, indent=4, formatter="json")
+
+            self.output()["stats"].dump(
+                stats,
+                indent=4,
+                formatter="json",
+            )
+
             return
 
-        # get all file sizes in bytes
         coll = self.input()["collection"]
         n = len(coll)
+
         sizes = [
             inp["events"].stat().st_size
-            for inp in self.iter_progress(coll.targets.values(), n, msg=f"loading {n} stats ...")
+            for inp in self.iter_progress(
+                coll.targets.values(),
+                n,
+                msg=f"loading {n} stats ...",
+            )
         ]
 
-        # helpers for avg and mean computation
         def get_avg_std(values):
-            n = len(values)
-            if n < 1:
-                return 0.0, 0.0
-            avg = sum(values) / n
-            if n < 2:
-                return avg, 0.0
-            std = (sum((v - avg)**2 for v in values) / (n - 1))**0.5
-            return avg, std
 
-        # compute some stats
+            n_values = len(values)
+
+            if n_values < 1:
+                return (
+                    0.0,
+                    0.0,
+                )
+
+            avg = sum(values) / n_values
+
+            if n_values < 2:
+                return (
+                    avg,
+                    0.0,
+                )
+
+            std = (
+                sum(
+                    (
+                        value - avg
+                    ) ** 2
+                    for value in values
+                )
+                / (
+                    n_values - 1
+                )
+            ) ** 0.5
+
+            return (
+                avg,
+                std,
+            )
+
         stats["n_test_files"] = n
-        stats["tot_size"] = sum(sizes)
-        stats["avg_size"], stats["std_size"] = get_avg_std(sizes)
-        stats["max_size_merged"] = self.merged_size * 1024**2  # MB to bytes
+        stats["tot_size"] = sum(
+            sizes,
+        )
 
-        # determine the number of files after merging, allowing a possible ~15% increase per file
-        # ReduceEvents already performs the first file-merging step.
-        # Therefore, estimate the second merging step from the number
-        # of ReduceEvents output files, not from the original NanoAOD count.
-        n_total = _get_n_reduced_files(self)
+        (
+            stats["avg_size"],
+            stats["std_size"],
+        ) = get_avg_std(
+            sizes,
+        )
+
+        stats["max_size_merged"] = (
+            self.merged_size
+            * 1024**2
+        )
+
+        # IMPORTANT:
+        # ReduceEvents already performs the first merging step.
+        #
+        # Therefore the second merging step must work with the
+        # number of ReduceEvents output files.
+        n_total = _get_n_reduced_files(
+            self,
+        )
+
         if n_total > 1:
-            # get the expected number of files after merging
-            n_merged_files = n_total / n * stats["tot_size"] / stats["max_size_merged"]
-            # round using some heuristics
-            rnd = math.ceil if n_merged_files % 1.0 > 0.15 else math.floor
-            n_merged_files = max(int(rnd(n_merged_files)), 1)
-            # determine the merging factor and adjust the number of merged files accordingly for numeric edge cases
-            stats["merge_factor"] = max(math.ceil(n_total / n_merged_files), 1)
-            n_merged_files = max(math.ceil(n_total / stats["merge_factor"]), 1)
+
+            n_merged_files = (
+                n_total
+                / n
+                * stats["tot_size"]
+                / stats["max_size_merged"]
+            )
+
+            rnd = (
+                math.ceil
+                if (
+                    n_merged_files % 1.0
+                    > 0.15
+                )
+                else math.floor
+            )
+
+            n_merged_files = max(
+                int(
+                    rnd(
+                        n_merged_files,
+                    ),
+                ),
+                1,
+            )
+
+            stats["merge_factor"] = max(
+                math.ceil(
+                    n_total
+                    / n_merged_files,
+                ),
+                1,
+            )
+
+            n_merged_files = max(
+                math.ceil(
+                    n_total
+                    / stats["merge_factor"],
+                ),
+                1,
+            )
+
         else:
-            # trivial case, no merging needed
+
             n_merged_files = 1
             stats["merge_factor"] = 1
 
-        # save them
-        self.output()["stats"].dump(stats, indent=4, formatter="json")
+        self.output()["stats"].dump(
+            stats,
+            indent=4,
+            formatter="json",
+        )
 
-        # print them
-        self.publish_message(f" stats of {n} input files ".center(40, "-"))
-        self.publish_message(f"average size: {law.util.human_bytes(stats['avg_size'], fmt=True)}")
-        self.publish_message(f"deviation   : {law.util.human_bytes(stats['std_size'], fmt=True)}")
-        self.publish_message(" merging info ".center(40, "-"))
-        self.publish_message(f"target size : {self.merged_size} MB")
-        self.publish_message(f"merging     : {stats['merge_factor']} into 1")
-        self.publish_message(f"files before: {n_total}")
-        self.publish_message(f"files after : {n_merged_files}")
-        tot_size = stats["avg_size"] * n_total
-        rel_err = stats["std_size"] / stats["avg_size"]
-        self.publish_message(f"total size  : {law.util.human_bytes(tot_size, fmt=True)} +- {rel_err * 100:.1f} %")
-        self.publish_message(40 * "-")
+        self.publish_message(
+            f" stats of {n} input files ".center(
+                40,
+                "-",
+            ),
+        )
+
+        self.publish_message(
+            f"average size: "
+            f"{law.util.human_bytes(stats['avg_size'], fmt=True)}",
+        )
+
+        self.publish_message(
+            f"deviation   : "
+            f"{law.util.human_bytes(stats['std_size'], fmt=True)}",
+        )
+
+        self.publish_message(
+            " merging info ".center(
+                40,
+                "-",
+            ),
+        )
+
+        self.publish_message(
+            f"target size : "
+            f"{self.merged_size} MB",
+        )
+
+        self.publish_message(
+            f"merging     : "
+            f"{stats['merge_factor']} into 1",
+        )
+
+        self.publish_message(
+            f"files before: "
+            f"{n_total}",
+        )
+
+        self.publish_message(
+            f"files after : "
+            f"{n_merged_files}",
+        )
+
+        tot_size = (
+            stats["avg_size"]
+            * n_total
+        )
+
+        rel_err = (
+            stats["std_size"]
+            / stats["avg_size"]
+            if stats["avg_size"]
+            else 0.0
+        )
+
+        self.publish_message(
+            f"total size  : "
+            f"{law.util.human_bytes(tot_size, fmt=True)} "
+            f"+- {rel_err * 100:.1f} %",
+        )
+
+        self.publish_message(
+            40 * "-",
+        )
 
 
 MergeReductionStatsWrapper = wrapper_factory(
     base_cls=AnalysisTask,
     require_cls=MergeReductionStats,
-    enable=["configs", "skip_configs", "datasets", "skip_datasets", "shifts", "skip_shifts"],
+    enable=[
+        "configs",
+        "skip_configs",
+        "datasets",
+        "skip_datasets",
+        "shifts",
+        "skip_shifts",
+    ],
 )
 
+
+# =============================================================================
+# MergeReducedEvents
+# =============================================================================
 
 class _MergeReducedEvents(
     CalibratorsMixin,
@@ -506,101 +976,208 @@ class MergeReducedEvents(_MergeReducedEvents):
     keep_reduced_events = luigi.BoolParameter(
         default=default_keep_reduced_events,
         significant=False,
-        description="whether to keep reduced input files after merging; when False, they are "
-        f"removed after successful merging; default: {default_keep_reduced_events}",
+        description=(
+            "whether to keep reduced input files after merging; "
+            "when False, they are removed after successful merging; "
+            f"default: {default_keep_reduced_events}"
+        ),
     )
 
-    sandbox = dev_sandbox(law.config.get("analysis", "default_columnar_sandbox"))
+    sandbox = dev_sandbox(
+        law.config.get(
+            "analysis",
+            "default_columnar_sandbox",
+        ),
+    )
 
-    # upstream requirements
     reqs = Requirements(
         RemoteWorkflow.reqs,
         MergeReductionStats=MergeReductionStats,
         ReduceEvents=ReduceEvents,
     )
 
-    # number of events per row group in the merged file
-    merging_row_group_size = law.config.get_expanded_int("analysis", "merging_row_group_size", 50_000)
+    merging_row_group_size = (
+        law.config.get_expanded_int(
+            "analysis",
+            "merging_row_group_size",
+            50_000,
+        )
+    )
 
-    @law.workflow_property(setter=True, cache=True, empty_value=0)
+    @law.workflow_property(
+        setter=True,
+        cache=True,
+        empty_value=0,
+    )
     def file_merging(self):
-        # check if the merging stats are present
-        stats = self.reqs.MergeReductionStats.req_different_branching(self, branch=0).output()["stats"]
-        return stats.load(formatter="json")["merge_factor"] if stats.exists() else 0
+
+        stats = (
+            self.reqs.MergeReductionStats
+            .req_different_branching(
+                self,
+                branch=0,
+            )
+            .output()["stats"]
+        )
+
+        return (
+            stats.load(
+                formatter="json",
+            )["merge_factor"]
+            if stats.exists()
+            else 0
+        )
 
     @law.dynamic_workflow_condition
     def workflow_condition(self):
-        # the workflow shape can be constructed as soon as a file_merging is known
-        return self.file_merging > 0
+        return (
+            self.file_merging
+            > 0
+        )
 
     @workflow_condition.create_branch_map
     def create_branch_map(self):
-        # MergeReducedEvents acts on ReduceEvents outputs, not directly
-        # on the original NanoAOD files.
-        n_files = _get_n_reduced_files(self)
-        n_merge = self.file_merging
 
-        chunks = law.util.iter_chunks(n_files,n_merge,)
-
-        return dict(enumerate(chunks))
-
-    def workflow_requires(self):
-        reqs = super().workflow_requires()
-
-        reqs["stats"] = self.reqs.MergeReductionStats.req_different_branching(
+        # This merging step acts on ReduceEvents outputs.
+        n_reduced_files = _get_n_reduced_files(
             self,
         )
 
-        n_reduced_files = _get_n_reduced_files(self)
+        n_merge = self.file_merging
 
-        reqs["events"] = self.reqs.ReduceEvents.req_different_branching(
+        chunks = law.util.iter_chunks(
+            n_reduced_files,
+            n_merge,
+        )
+
+        return dict(
+            enumerate(
+                chunks,
+            ),
+        )
+
+    def workflow_requires(self):
+
+        reqs = super().workflow_requires()
+
+        reqs["stats"] = (
+            self.reqs.MergeReductionStats
+            .req_different_branching(
+                self,
+            )
+        )
+
+        n_reduced_files = _get_n_reduced_files(
             self,
-            branches=((0, n_reduced_files),),
+        )
+
+        reqs["events"] = (
+            self.reqs.ReduceEvents
+            .req_different_branching(
+                self,
+                branches=(
+                    (
+                        0,
+                        n_reduced_files,
+                    ),
+                ),
+            )
         )
 
         return reqs
 
     def requires(self):
+
         return {
-            "stats": self.reqs.MergeReductionStats.req_different_branching(self, branch=0),
-            "events": self.reqs.ReduceEvents.req_different_branching(
-                self,
-                workflow="local",
-                branches=((min(self.branch_data), max(self.branch_data) + 1),),
-                _exclude={"branch"},
+            "stats": (
+                self.reqs.MergeReductionStats
+                .req_different_branching(
+                    self,
+                    branch=0,
+                )
+            ),
+            "events": (
+                self.reqs.ReduceEvents
+                .req_different_branching(
+                    self,
+                    workflow="local",
+                    branches=(
+                        (
+                            min(
+                                self.branch_data,
+                            ),
+                            max(
+                                self.branch_data,
+                            ) + 1,
+                        ),
+                    ),
+                    _exclude={
+                        "branch",
+                    },
+                )
             ),
         }
 
     @workflow_condition.output
     def output(self):
+
         return {
-            "events": self.target(f"events_{self.branch}.parquet"),
+            "events": self.target(
+                f"events_{self.branch}.parquet",
+            ),
         }
 
     def run(self):
-        # prepare inputs and output
-        inputs = [inp["events"] for inp in self.input()["events"].collection.targets.values()]
-        output = self.output()["events"]
 
-        # merge
+        inputs = [
+            inp["events"]
+            for inp
+            in (
+                self.input()["events"]
+                .collection
+                .targets
+                .values()
+            )
+        ]
+
+        output = self.output()[
+            "events"
+        ]
+
         law.pyarrow.merge_parquet_task(
             task=self,
             inputs=inputs,
             output=output,
-            callback=self.create_progress_callback(len(inputs)),
+            callback=self.create_progress_callback(
+                len(inputs),
+            ),
             writer_opts=self.get_parquet_writer_opts(),
             target_row_group_size=self.merging_row_group_size,
         )
 
-        # log the number of events after merging
-        n_events = output.load(formatter="parquet").metadata.num_rows
-        self.publish_message(f"merged file contains {n_events:_} events")
-        if not n_events:
-            self.logger.warning("the merged file contains no events")
+        n_events = (
+            output
+            .load(
+                formatter="parquet",
+            )
+            .metadata
+            .num_rows
+        )
 
-        # optionally remove initial inputs
-        if not self.keep_reduced_events and self.is_leaf():
-            with self.publish_step("removing reduced inputs ..."):
+        self.publish_message(
+            f"merged file contains "
+            f"{n_events:_} events",
+        )
+
+        if not n_events:
+            self.logger.warning(
+                "the merged file contains no events",
+            )
+
+        if (not self.keep_reduced_events):
+            with self.publish_step(
+                "removing reduced inputs ...",
+            ):
                 for inp in inputs:
                     inp.remove()
 
@@ -608,9 +1185,20 @@ class MergeReducedEvents(_MergeReducedEvents):
 MergeReducedEventsWrapper = wrapper_factory(
     base_cls=AnalysisTask,
     require_cls=MergeReducedEvents,
-    enable=["configs", "skip_configs", "datasets", "skip_datasets", "shifts", "skip_shifts"],
+    enable=[
+        "configs",
+        "skip_configs",
+        "datasets",
+        "skip_datasets",
+        "shifts",
+        "skip_shifts",
+    ],
 )
 
+
+# =============================================================================
+# ProvideReducedEvents
+# =============================================================================
 
 class _ProvideReducedEvents(
     CalibratorsMixin,
@@ -628,16 +1216,22 @@ class ProvideReducedEvents(_ProvideReducedEvents):
 
     skip_merging = luigi.BoolParameter(
         default=False,
-        description="bypass MergedReducedEvents and directly require ReduceEvents with same "
-        "workflow branching; default: False",
-    )
-    force_merging = luigi.BoolParameter(
-        default=False,
-        description="force requiring MergedReducedEvents, regardless of the merging factor "
-        "obtained by MergeReductionStats; default: False",
+        description=(
+            "bypass MergeReducedEvents and directly require "
+            "ReduceEvents with same workflow branching; "
+            "default: False"
+        ),
     )
 
-    # upstream requirements
+    force_merging = luigi.BoolParameter(
+        default=False,
+        description=(
+            "force requiring MergeReducedEvents, regardless "
+            "of the merging factor obtained by "
+            "MergeReductionStats; default: False"
+        ),
+    )
+
     reqs = Requirements(
         RemoteWorkflow.reqs,
         ReduceEvents=ReduceEvents,
@@ -646,165 +1240,70 @@ class ProvideReducedEvents(_ProvideReducedEvents):
     )
 
     @classmethod
-    def _resolve_workflow_parameters(cls, params):
-        # always fallback to local workflows
-        params["effective_workflow"] = "local"
-        return super()._resolve_workflow_parameters(params)
+    def _resolve_workflow_parameters(
+        cls,
+        params,
+    ):
 
-    @law.workflow_property(setter=True, cache=True, empty_value=0)
+        params["effective_workflow"] = (
+            "local"
+        )
+
+        return (
+            super()
+            ._resolve_workflow_parameters(
+                params,
+            )
+        )
+
+    @law.workflow_property(
+        setter=True,
+        cache=True,
+        empty_value=0,
+    )
     def file_merging(self):
-        if self.skip_merging or _get_n_reduced_files(self) == 1:
+
+        # This property describes only the second merging stage.
+        if (
+            self.skip_merging
+            or _get_n_reduced_files(self) == 1
+        ):
             return 1
 
-        stats = self.reqs.MergeReductionStats.req_different_branching(
-            self,
-            branch=0,
-        ).output()["stats"]
+        stats = (
+            self.reqs.MergeReductionStats
+            .req_different_branching(
+                self,
+                branch=0,
+            )
+            .output()["stats"]
+        )
 
-        return stats.load(formatter="json")["merge_factor"] if stats.exists() else 0
+        return (
+            stats.load(
+                formatter="json",
+            )["merge_factor"]
+            if stats.exists()
+            else 0
+        )
 
     @law.dynamic_workflow_condition
     def workflow_condition(self):
-        # the workflow shape can be constructed as soon as a file_merging is known
-        return self.file_merging > 0
-
-    def _req_reduced_events(self, **params) -> law.Task:
-        return self.reqs.ReduceEvents.req(self, **params)
-
-    def _req_merged_reduced_events(self, **params) -> law.Task:
-        return self.reqs.MergeReducedEvents.req(self, **params)
-
-    def workflow_requires(self):
-        reqs = super().workflow_requires()
-
-        # strategy:
-        # - when it is clear that the reduced events are being used directly, require them when not
-        #   in pilot mode
-        # - otherwise, always require the reduction stats as they are needed to make a decision
-        # - when merging is forced, require it
-        # - otherwise, and if the merging is already known, require either reduced or merged events
-        # TODO: merging: check n_files usage
-        if self.skip_merging or (not self.force_merging and _get_n_reduced_files(self) == 1):
-            # reduced events are used directly without having to look into the file merging factor
-            if not self.pilot:
-                reqs["events"] = self._req_reduced_events()
-        else:
-            # here, the merging is unclear so require the stats
-            reqs["reduction_stats"] = self.reqs.MergeReductionStats.req_different_branching(self)
-
-            if self.force_merging:
-                # require merged events when forced
-                reqs["events"] = self._req_merged_reduced_events()
-            else:
-                # require either when the file merging is known, and nothing otherwise to let the
-                # dynamic dependency definition resolve it at runtime
-                file_merging = self.file_merging
-                if file_merging > 1:
-                    reqs["events"] = self._req_merged_reduced_events()
-                elif file_merging == 1 and not self.pilot:
-                    reqs["events"] = self._req_reduced_events()
-
-        # move reduction stats requirement to the end
-        if "reduction_stats" in reqs:
-            reqs.move_to_end("reduction_stats")
-
-        return reqs
-
-    def requires(self):
-        # same as for workflow requirements without optional pilot check
-        reqs = DotDict()
-        # TODO: merging: check n_files usage
-        if self.skip_merging or (not self.force_merging and _get_n_reduced_files(self) == 1):
-            reqs["events"] = self._req_reduced_events()
-        else:
-            reqs["reduction_stats"] = self.reqs.MergeReductionStats.req_different_branching(self, branch=0)
-
-            if self.force_merging:
-                reqs["events"] = self._req_merged_reduced_events()
-            else:
-                file_merging = self.file_merging
-                if file_merging > 1:
-                    reqs["events"] = self._req_merged_reduced_events()
-                elif file_merging == 1:
-                    reqs["events"] = self._req_reduced_events()
-
-        # move reduction stats requirement to the end
-        if "reduction_stats" in reqs:
-            reqs.move_to_end("reduction_stats")
-
-        return reqs
-
-    @workflow_condition.output
-    def output(self):
-        # the "events" requirement is known at this point
-        req = self.requires()["events"]
-
-        # to simplify the handling for downstream tasks, extract the single output from workflows
-        output = req.output()
-        return list(output.collection.targets.values())[0] if req.is_workflow() else output
-
-    def _yield_dynamic_deps(self):
-        # do nothing if a decision was pre-set in which case requirements were already triggered
-        # TODO: merging: check n_files usage
-        if self.skip_merging or (not self.force_merging and _get_n_reduced_files(self) == 1):
-            return
-
-        # yield the appropriate requirement
-        yield (
-            self._req_reduced_events()
-            if self.file_merging == 1
-            else self._req_merged_reduced_events()
-        )
-
-    def local_workflow_pre_run(self):
-        return self._yield_dynamic_deps()
-
-    def run(self):
-        return self._yield_dynamic_deps()
-
-
-ProvideReducedEventsWrapper = wrapper_factory(
-    base_cls=AnalysisTask,
-    require_cls=ProvideReducedEvents,
-    enable=["configs", "skip_configs", "datasets", "skip_datasets", "shifts", "skip_shifts"],
-)
-
-
-class ReducedEventsUser(
-    CalibratorsMixin,
-    SelectorMixin,
-    ReducerMixin,
-    law.BaseWorkflow,
-):
-    # upstream requirements
-    reqs = Requirements(
-        ProvideReducedEvents=ProvideReducedEvents,
-    )
-
-    @law.workflow_property(setter=True, cache=True, empty_value=0)
-    def file_merging(self):
-        provide_task = self.reqs.ProvideReducedEvents.req(self)
-
-        second_stage_merging = provide_task.file_merging
-
-        if second_stage_merging <= 0:
-            return second_stage_merging
-
-        first_stage_merging = _get_reduce_file_merging_factor(self)
 
         return (
-            first_stage_merging
-            *
-            second_stage_merging
+            self.file_merging
+            > 0
         )
 
     @workflow_condition.create_branch_map
     def create_branch_map(self):
-        n_reduced_files = _get_n_reduced_files(self)
 
-        # When merging is skipped, ProvideReducedEvents maps one-to-one
-        # to ReduceEvents. Otherwise, it follows the second-stage
-        # MergeReducedEvents grouping.
+        # This task follows the branch structure of the final
+        # reduced-event files.
+        n_reduced_files = _get_n_reduced_files(
+            self,
+        )
+
         n_merge = (
             1
             if self.skip_merging
@@ -816,8 +1315,298 @@ class ReducedEventsUser(
             n_merge,
         )
 
-        return dict(enumerate(chunks))
+        return dict(
+            enumerate(
+                chunks,
+            ),
+        )
+
+    def _req_reduced_events(
+        self,
+        **params,
+    ) -> law.Task:
+
+        return (
+            self.reqs.ReduceEvents
+            .req(
+                self,
+                **params,
+            )
+        )
+
+    def _req_merged_reduced_events(
+        self,
+        **params,
+    ) -> law.Task:
+
+        return (
+            self.reqs.MergeReducedEvents
+            .req(
+                self,
+                **params,
+            )
+        )
+
+    def workflow_requires(self):
+
+        reqs = super().workflow_requires()
+
+        if (
+            self.skip_merging
+            or (
+                not self.force_merging
+                and _get_n_reduced_files(self) == 1
+            )
+        ):
+
+            if not self.pilot:
+                reqs["events"] = (
+                    self._req_reduced_events()
+                )
+
+        else:
+
+            reqs["reduction_stats"] = (
+                self.reqs.MergeReductionStats
+                .req_different_branching(
+                    self,
+                )
+            )
+
+            if self.force_merging:
+
+                reqs["events"] = (
+                    self._req_merged_reduced_events()
+                )
+
+            else:
+
+                file_merging = (
+                    self.file_merging
+                )
+
+                if file_merging > 1:
+
+                    reqs["events"] = (
+                        self._req_merged_reduced_events()
+                    )
+
+                elif (
+                    file_merging == 1
+                    and not self.pilot
+                ):
+
+                    reqs["events"] = (
+                        self._req_reduced_events()
+                    )
+
+        if "reduction_stats" in reqs:
+            reqs.move_to_end(
+                "reduction_stats",
+            )
+
+        return reqs
+
+    def requires(self):
+
+        reqs = DotDict()
+
+        if (
+            self.skip_merging
+            or (
+                not self.force_merging
+                and _get_n_reduced_files(self) == 1
+            )
+        ):
+
+            reqs["events"] = (
+                self._req_reduced_events()
+            )
+
+        else:
+
+            reqs["reduction_stats"] = (
+                self.reqs.MergeReductionStats
+                .req_different_branching(
+                    self,
+                    branch=0,
+                )
+            )
+
+            if self.force_merging:
+
+                reqs["events"] = (
+                    self._req_merged_reduced_events()
+                )
+
+            else:
+
+                file_merging = (
+                    self.file_merging
+                )
+
+                if file_merging > 1:
+
+                    reqs["events"] = (
+                        self._req_merged_reduced_events()
+                    )
+
+                elif file_merging == 1:
+
+                    reqs["events"] = (
+                        self._req_reduced_events()
+                    )
+
+        if "reduction_stats" in reqs:
+            reqs.move_to_end(
+                "reduction_stats",
+            )
+
+        return reqs
+
+    @workflow_condition.output
+    def output(self):
+
+        req = self.requires()[
+            "events"
+        ]
+
+        output = req.output()
+
+        return (
+            list(
+                output
+                .collection
+                .targets
+                .values(),
+            )[0]
+            if req.is_workflow()
+            else output
+        )
+
+    def _yield_dynamic_deps(self):
+
+        if (
+            self.skip_merging
+            or (
+                not self.force_merging
+                and _get_n_reduced_files(self) == 1
+            )
+        ):
+            return
+
+        yield (
+            self._req_reduced_events()
+            if self.file_merging == 1
+            else self._req_merged_reduced_events()
+        )
+
+    def local_workflow_pre_run(self):
+        return (
+            self._yield_dynamic_deps()
+        )
+
+    def run(self):
+        return (
+            self._yield_dynamic_deps()
+        )
+
+
+ProvideReducedEventsWrapper = wrapper_factory(
+    base_cls=AnalysisTask,
+    require_cls=ProvideReducedEvents,
+    enable=[
+        "configs",
+        "skip_configs",
+        "datasets",
+        "skip_datasets",
+        "shifts",
+        "skip_shifts",
+    ],
+)
+
+
+# =============================================================================
+# ReducedEventsUser
+# =============================================================================
+
+class ReducedEventsUser(
+    CalibratorsMixin,
+    SelectorMixin,
+    ReducerMixin,
+    law.BaseWorkflow,
+):
+
+    reqs = Requirements(
+        ProvideReducedEvents=ProvideReducedEvents,
+    )
+
+    @law.workflow_property(
+        setter=True,
+        cache=True,
+        empty_value=0,
+    )
+    def file_merging(self):
+        """
+        Effective merging factor relative to the original dataset.
+
+        Example:
+
+            ReduceEvents.file_merging = 10
+            MergeReducedEvents.file_merging = 2
+
+        gives:
+
+            effective file_merging = 20
+        """
+
+        provide_task = (
+            self.reqs
+            .ProvideReducedEvents
+            .req(self)
+        )
+
+        second_stage_merging = (
+            provide_task.file_merging
+        )
+
+        if second_stage_merging <= 0:
+            return second_stage_merging
+
+        first_stage_merging = (
+            _get_reduce_file_merging_factor(
+                self,
+            )
+        )
+
+        return (
+            first_stage_merging
+            * second_stage_merging
+        )
+
+    @law.dynamic_workflow_condition
+    def workflow_condition(self):
+
+        return (
+            self.reqs
+            .ProvideReducedEvents
+            .req(self)
+            .workflow_condition()
+        )
 
     @workflow_condition.create_branch_map
     def create_branch_map(self):
-        return super().create_branch_map()
+
+        # Here file_merging is the combined factor relative
+        # to the original dataset:
+        #
+        # ReduceEvents.file_merging
+        # ×
+        # second-stage merging factor
+        #
+        # Therefore DatasetTask's normal create_branch_map
+        # produces exactly the correct final branch count.
+        return (
+            super()
+            .create_branch_map()
+        )
