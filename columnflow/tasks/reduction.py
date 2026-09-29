@@ -520,6 +520,8 @@ def _get_reduce_file_merging_factor(task) -> int:
         )
 
     file_merging = ReduceEvents.file_merging
+    if isinstance(file_merging, property):
+        file_merging = file_merging.__get__(task, type(task))
 
     if isinstance(file_merging, int):
         if file_merging < 0:

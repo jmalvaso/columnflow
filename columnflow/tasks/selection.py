@@ -210,10 +210,9 @@ class SelectEvents(_SelectEvents):
                 # optional check for overlapping inputs within additional columns
                 if self.check_overlapping_inputs:
                     self.raise_if_overlapping(list(cols))
-
-                # insert additional columns
+                    
                 events = update_ak_array(events, *cols)
-
+                
                 # add aliases
                 events = add_ak_aliases(
                     events,
