@@ -52,6 +52,13 @@ class BundleRepo(AnalysisTask, law.git.BundleGitRepository, law.tasks.TransferLo
         # excluded from analysis repo
         _repo_path(".law", "cms"),
         _repo_path(".setups"),
+        # local migration / bookkeeping files that must never enter BundleRepo
+        _repo_path("scripts", "migration_file"),
+        _repo_path("scripts", "migration_audit.txt"),
+        _repo_path("scripts", "failed_jobs.csv"),
+        _repo_path("scripts", "check_migration.py"),
+        _repo_path("scripts", "distribution_for_datacard_bkgs.sh"),
+        _repo_path("scripts", "tar_eos_output.sh"),
         # also make sure that CF specific files that are not part of the repository are excluded
         os.environ["CF_STORE_LOCAL"],
         os.environ["CF_SOFTWARE_BASE"],
