@@ -15,6 +15,7 @@ import law
 import order as od
 
 from columnflow.types import Any, Iterable, Sequence
+from columnflow.tasks.framework.histogram_categories import HistogramCategoriesMixin
 from columnflow.tasks.framework.base import ConfigTask, DatasetTask, TaskShifts, RESOLVE_DEFAULT
 from columnflow.tasks.framework.parameters import SettingsParameter, DerivableInstParameter, DerivableInstsParameter
 from columnflow.calibration import Calibrator
@@ -1729,7 +1730,7 @@ class MLModelsMixin(ConfigTask):
         return keys
 
 
-class HistProducerClassMixin(ArrayFunctionClassMixin):
+class HistProducerClassMixin(HistogramCategoriesMixin, ArrayFunctionClassMixin):
     """
     Mixin to include and access single :py:class:`~columnflow.histogramming.HistProducer` class.
     """

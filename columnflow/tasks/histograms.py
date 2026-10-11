@@ -23,6 +23,7 @@ from columnflow.tasks.reduction import ReducedEventsUser
 from columnflow.tasks.production import ProduceColumns
 from columnflow.tasks.ml import MLEvaluation
 from columnflow.hist_util import update_ax_labels, sum_hists
+from columnflow.histogram_io import histogram_storage_groups, uses_histogram_bundles
 from columnflow.config_util import expand_shift_sources
 from columnflow.util import maybe_import, dev_sandbox
 from columnflow.types import TYPE_CHECKING
@@ -414,6 +415,32 @@ CreateHistogramsWrapper = wrapper_factory(
 )
 
 
+class MergedVariablesMixinWorkflow(VariablesMixinWorkflow):
+    """Canonicalize storage blocks only for merged histograms, leaving event tasks unchanged."""
+
+    @classmethod
+    def resolve_param_values_post_init(cls, params):
+        params = super().resolve_param_values_post_init(params)
+        config_inst = cls._get_config_container(params)
+        if config_inst is not None and uses_histogram_bundles(config_inst):
+            groups = histogram_storage_groups(
+                config_inst, params.get("variables", ()), dataset=params.get("dataset"),
+            )
+            params["variables"] = tuple(sorted({variable for group in groups.values() for variable in group}))
+        return params
+
+    def get_histogram_storage_groups(self, variables=None):
+        return histogram_storage_groups(
+            self.config_inst, self.variables if variables is None else variables, dataset=self.dataset_inst,
+        )
+
+    def control_output_postfix(self):
+        postfix = super().control_output_postfix()
+        if uses_histogram_bundles(self.config_inst):
+            postfix += "__bundled"
+        return postfix
+
+
 class _MergeHistograms(
     CalibratorsMixin,
     SelectorMixin,
@@ -421,7 +448,7 @@ class _MergeHistograms(
     ProducersMixin,
     MLModelsMixin,
     HistProducerMixin,
-    VariablesMixinWorkflow,
+    MergedVariablesMixinWorkflow,
 ):
     """
     Base classes for :py:class:`MergeHistograms`.
@@ -470,6 +497,9 @@ class MergeHistograms(_MergeHistograms):
         # optional dynamic behavior: determine not yet created variables and require only those
         if self.only_missing:
             missing = self.output()["hists"].count(existing=False, keys=True)[1]
+            if uses_histogram_bundles(self.config_inst):
+                groups = self.get_histogram_storage_groups()
+                missing = {variable for key in missing for variable in groups[key]}
             variables = sorted(missing, key=variables.index)
 
         return variables
@@ -479,6 +509,14 @@ class MergeHistograms(_MergeHistograms):
 
         variables = self._get_variables()
         if variables:
+            if uses_histogram_bundles(self.config_inst):
+                reqs["hists"] = {
+                    key: self.pilot_workflow_requires(self.reqs.CreateHistograms.req_different_branching(
+                        self, branch=-1, variables=group_variables,
+                    ))
+                    for key, group_variables in self.get_histogram_storage_groups(variables).items()
+                }
+                return reqs
             reqs["hists"] = self.pilot_workflow_requires(self.reqs.CreateHistograms.req_different_branching(
                 self,
                 branch=-1,
@@ -492,6 +530,14 @@ class MergeHistograms(_MergeHistograms):
         if not variables:
             return []
 
+        if uses_histogram_bundles(self.config_inst):
+            return {
+                key: self.reqs.CreateHistograms.req_different_branching(
+                    self, branch=-1, variables=group_variables, workflow="local",
+                )
+                for key, group_variables in self.get_histogram_storage_groups(variables).items()
+            }
+
         return self.reqs.CreateHistograms.req_different_branching(
             self,
             branch=-1,
@@ -500,6 +546,13 @@ class MergeHistograms(_MergeHistograms):
         )
 
     def output(self):
+        if uses_histogram_bundles(self.config_inst):
+            return {
+                "hists": law.SiblingFileCollection({
+                    key: self.target(f"hist__bundle_{key}.pickle")
+                    for key in self.get_histogram_storage_groups()
+                }),
+            }
         return {
             "hists": law.SiblingFileCollection({
                 variable_name: self.target(f"hist__var_{variable_name}.pickle")
@@ -510,6 +563,8 @@ class MergeHistograms(_MergeHistograms):
     @law.decorator.notify
     @law.decorator.log
     def run(self):
+        if uses_histogram_bundles(self.config_inst):
+            return self.run_bundled()
         # preare inputs and outputs
         inputs = self.input()["collection"]
         outputs = self.output()
@@ -552,6 +607,37 @@ class MergeHistograms(_MergeHistograms):
         if self.remove_previous:
             inputs.remove()
 
+    def run_bundled(self):
+        inputs = self.input()
+        outputs = self.output()["hists"].targets
+        groups = self.get_histogram_storage_groups()
+        self._array_function_post_init()
+
+        for key, inp in self.iter_progress(inputs.items(), len(inputs)):
+            collection = inp["collection"]
+            hists = [target["hists"].load(formatter="pickle") for target in collection.targets.values()]
+            if not hists:
+                raise ValueError(f"no input histograms for storage group {key!r}")
+
+            merged_hists = {}
+            for variable in groups[key]:
+                variable_hists = [h[variable] for h in hists]
+                update_ax_labels(variable_hists, self.config_inst, variable)
+                merged = sum_hists(variable_hists)
+                merged = self.hist_producer_inst.run_post_process_merged_hist(h=merged, task=self)
+                if self.hist_producer_inst.post_process_merged_compatibility_check:
+                    CreateHistograms.check_histogram_compatibility(merged)
+                merged_hists[variable] = merged
+
+            target = outputs[key]
+            perm = 0 if target.exists() else None
+            target.dump(merged_hists, perm=perm, formatter="pickle")
+
+        # Keep branch histograms unless removal is explicitly requested.
+        if self.remove_previous:
+            for inp in inputs.values():
+                inp["collection"].remove()
+
 
 MergeHistogramsWrapper = wrapper_factory(
     base_cls=AnalysisTask,
@@ -568,7 +654,7 @@ class _MergeShiftedHistograms(
     ProducerClassesMixin,
     MLModelsMixin,
     HistProducerClassMixin,
-    VariablesMixinWorkflow,
+    MergedVariablesMixinWorkflow,
 ):
     """
     Base classes for :py:class:`MergeShiftedHistograms`.
@@ -682,6 +768,13 @@ class MergeShiftedHistograms(_MergeShiftedHistograms):
             )
         )
     def output(self):
+        if uses_histogram_bundles(self.config_inst):
+            return {
+                "hists": law.SiblingFileCollection({
+                    key: self.target(f"hists__bundle_{key}.pickle")
+                    for key in self.get_histogram_storage_groups()
+                }),
+            }
         return {
             "hists": law.SiblingFileCollection({
                 variable: self.target(f"hists__{variable}.pickle")
@@ -698,6 +791,8 @@ class MergeShiftedHistograms(_MergeShiftedHistograms):
     @law.decorator.notify
     @law.decorator.log
     def run(self):
+        if uses_histogram_bundles(self.config_inst):
+            return self.run_bundled()
         # preare inputs and outputs
         inputs = self.input()
         outputs = self.output()["hists"].targets
@@ -732,6 +827,28 @@ class MergeShiftedHistograms(_MergeShiftedHistograms):
                 # invoke modification hook, then save
                 merged = self.modify_merged_hist(variable_name, merged)
                 outp.dump(merged, formatter="pickle")
+
+    def run_bundled(self):
+        inputs = self.input()
+        outputs = self.output()["hists"].targets
+        for key, variables in self.iter_progress(
+            self.get_histogram_storage_groups().items(), len(outputs),
+        ):
+            # Read each physical input file once per storage block.
+            payloads = {
+                shift: inp["hists"].targets[key].load(formatter="pickle")
+                for shift, inp in inputs.items()
+            }
+            merged_hists = {}
+            for variable in variables:
+                variable_hists = [
+                    self.modify_input_hist(shift, variable, payload[variable])
+                    for shift, payload in payloads.items()
+                ]
+                update_ax_labels(variable_hists, self.config_inst, variable)
+                merged = sum_hists(variable_hists)
+                merged_hists[variable] = self.modify_merged_hist(variable, merged)
+            outputs[key].dump(merged_hists, formatter="pickle")
 
     def modify_input_hist(self, shift: str, variable: str, h: hist.Hist) -> hist.Hist:
         """

@@ -16,6 +16,7 @@ from columnflow.tasks.framework.mixins import (
 )
 from columnflow.tasks.framework.remote import RemoteWorkflow
 from columnflow.tasks.histograms import MergeShiftedHistograms
+from columnflow.histogram_io import load_histogram
 from columnflow.inference import InferenceModel
 from columnflow.config_util import get_datasets_from_process
 from columnflow.util import dev_sandbox, DotDict, maybe_import
@@ -393,11 +394,11 @@ class SerializeInferenceModelBase(_SerializeInferenceModelBase):
                 for inp in inputs[dataset_name]["collection"].targets.values():
                     # open the histogram
                     try:
-                        h = inp["hists"][variable].load(formatter="pickle")
+                        h = load_histogram(inp["hists"], variable, config_inst, dataset=dataset_name)
                     except Exception as e:
                         raise Exception(
                             f"failed to load '{variable}' histogram for dataset '{dataset_name}' in config "
-                            f"'{config_inst.name}' from {inp['hists'][variable].abspath}",
+                            f"'{config_inst.name}' from histogram inputs: {e}",
                         ) from e
 
                     # determine processes to extract

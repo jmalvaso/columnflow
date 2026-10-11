@@ -505,11 +505,52 @@ def prepare_style_config(
             "com": config_inst.campaign.ecm,
         },
     }
-
     # build the label from category and optional variable selection labels
     if category_inst:
+        import re
+
         cat_label = join_labels(category_inst.label, variable_inst.x("selection_label", None))
-        style_config["annotate_cfg"] = {"text": cat_label or ""}
+
+        # abbreviate the signal region
+        cat_label = re.sub(
+            r"signal\s+region",
+            "SR",
+            cat_label,
+            flags=re.IGNORECASE,
+        )
+
+        # remove redundant "category" after BDT
+        cat_label = re.sub(
+            r"BDT\s+cat(?:egory)?\b",
+            "BDT",
+            cat_label,
+            flags=re.IGNORECASE,
+        )
+
+        # start a new line before the BDT description
+        cat_label = re.sub(
+            r"\s*,?\s*(?=BDT\b)",
+            "\n",
+            cat_label,
+            flags=re.IGNORECASE,
+        )
+
+        # start a new line before the mass (M=100, M100, etc.)
+        cat_label = re.sub(
+            r"\s*(?=\(\s*M\s*=?\s*\d+\s*\))",
+            "\n",
+            cat_label,
+        )
+
+        style_config["annotate_cfg"] = {
+            "text": cat_label.strip(),
+            "xy": (0.04, 0.95),
+            "xycoords": "axes fraction",
+            "fontsize": 13,
+            "linespacing": 1.2,
+            "horizontalalignment": "left",
+            "verticalalignment": "top",
+        }
 
     # disable minor ticks based on variable_inst
     axis_type = variable_inst.x("axis_type", "variable")

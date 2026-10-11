@@ -16,6 +16,7 @@ from columnflow.tasks.framework.mixins import (
 )
 from columnflow.tasks.histograms import MergeHistograms, MergeShiftedHistograms
 from columnflow.hist_util import select_category_bins
+from columnflow.histogram_io import load_histogram
 from columnflow.util import dev_sandbox, maybe_import
 from columnflow.types import TYPE_CHECKING
 
@@ -69,7 +70,10 @@ class HistogramsUserBase(
             variable = variable.name
         if isinstance(config, od.Config):
             config = config.name
-        histogram = inputs[config][dataset]["collection"][0]["hists"].targets[variable].load(formatter="pickle")
+        config_inst = next(inst for inst in self.config_insts if inst.name == config)
+        histogram = load_histogram(
+            inputs[config][dataset]["collection"][0]["hists"], variable, config_inst, dataset=dataset,
+        )
 
         if update_label:
             # get variable label from first config instance
