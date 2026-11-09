@@ -416,7 +416,15 @@ class DatacardWriter(object):
                             effect = 1.0
 
                 # custom hook to modify the effect
-                effect = self.modify_parameter_effect(cat_obj, proc_obj, param_obj, effect)
+                effect = self.modify_parameter_effect(
+                    cat_obj, proc_obj, param_obj, effect,
+                )
+
+                # InferenceModel.parameter_spec() stores None
+                # for shape parameters. Combine expects "1"
+                # to activate the corresponding shape variation.
+                if param_obj.type.is_shape and effect is None:
+                    effect = 1.0
 
                 # encode the effect
                 if isinstance(effect, (int, float)):

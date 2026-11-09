@@ -570,10 +570,39 @@ class PlotVariablesBase(_PlotVariablesBase):
                             # skip empty histograms right away
                             if h.empty():
                                 continue
-
+                            
                             # create expected shift bins and fill them with the nominal histogram
                             expected_shifts = plot_shift_names & process_shift_map[process_inst.name]
-                            add_missing_shifts(h, expected_shifts, str_axis="shift", nominal_bin="nominal")
+
+                            # A nominal histogram can legitimately be empty, especially in
+                            # low-statistics BDT categories.
+                            #
+                            # In that case, the growing shift axis may contain only systematic
+                            # variations that selected at least one event.
+                            if "nominal" not in h.axes["shift"]:
+
+                                self.logger.warning(
+                                    "Missing nominal shift bin for "
+                                    f"dataset={dataset_inst.name}, "
+                                    f"process={process_inst.name}, "
+                                    f"variable={var_name}, "
+                                    f"category={cat_name}. "
+                                    "Creating an empty nominal bin."
+                                )
+
+                                h = ensure_bin_exists(
+                                    h,
+                                    "shift",
+                                    "nominal",
+                                )
+
+                            # Add the remaining missing shifts using the nominal histogram.
+                            add_missing_shifts(
+                                h,
+                                expected_shifts,
+                                str_axis="shift",
+                                nominal_bin="nominal",
+                            )
 
                             # add the histogram
                             if process_inst in hists_config:
